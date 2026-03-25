@@ -130,28 +130,28 @@ def render_tokens(final_tokens: list[dict], non_final_tokens: list[dict]) -> str
     # Process all tokens in order.
     for token in final_tokens + non_final_tokens:
         text = token["text"]
+        if text == "<end>":
+            continue
         speaker = token.get("speaker")
         language = token.get("language")
         is_translation = token.get("translation_status") == "translation"
 
         # Speaker changed -> add a speaker tag.
-        if speaker is not None and speaker != current_speaker:
-            if current_speaker is not None:
-                text_parts.append("\n\n")
-            current_speaker = speaker
-            current_language = None  # Reset language on speaker changes.
-            text_parts.append(f"Speaker {current_speaker}:")
+        #if speaker is not None and speaker != current_speaker:
+        #    if current_speaker is not None:
+        #        text_parts.append("\n\n")
+        #    current_speaker = speaker
+        #    current_language = None  # Reset language on speaker changes.
+        #    text_parts.append(f"Speaker {current_speaker}:")
 
         # Language changed -> add a language or translation tag.
         if language is not None and language != current_language:
             current_language = language
             prefix = "[Translation] " if is_translation else ""
-            text_parts.append(f"\n{prefix}[{current_language}] ")
+            text_parts.append(f"{prefix}[{current_language}] ")
             text = text.lstrip()
 
         text_parts.append(text)
-
-    text_parts.append("\n===============================")
 
     return "".join(text_parts)
 
@@ -176,7 +176,9 @@ def run_session(api_key: str, device_index: int) -> None:
         print("Session started. Speak into your microphone. Press Ctrl+C to stop.")
 
         final_tokens: list[dict] = []
+        final_translation_tokens: list[dict] = []
         prev_final_count = 0
+        prev_translation_count = 0
 
         try:
             while True:
@@ -192,15 +194,20 @@ def run_session(api_key: str, device_index: int) -> None:
                 non_final_tokens: list[dict] = []
                 for token in res.get("tokens", []):
                     if token.get("text"):
+                        # Track translation tokens separately (not printed,
+                        # but available as a signal for external translation).
+                        if token.get("translation_status") == "translation":
+                            if token.get("is_final"):
+                                final_translation_tokens.append(token)
+                            continue
                         if token.get("is_final"):
                             final_tokens.append(token)
                         # else:
                         #     non_final_tokens.append(token)
 
-                # Only re-render when we have new final tokens.
-                # (Uncomment the non_final_tokens block above and remove
-                # this guard to restore the original always-reprint behavior.)
-                if len(final_tokens) == prev_final_count:
+                # Print buffered transcription tokens when a translation arrives.
+                # (Change to `len(final_tokens) == prev_final_count` to print immediately.)
+                if len(final_translation_tokens) == prev_translation_count:
                     continue
 
                 # Print only the new final tokens since last print.
@@ -209,6 +216,7 @@ def run_session(api_key: str, device_index: int) -> None:
                 #   print(text)
                 new_tokens = final_tokens[prev_final_count:]
                 prev_final_count = len(final_tokens)
+                prev_translation_count = len(final_translation_tokens)
                 text = render_tokens(new_tokens, non_final_tokens)
                 print(text)
 
