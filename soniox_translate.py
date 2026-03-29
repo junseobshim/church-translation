@@ -1,10 +1,15 @@
 import json
 import os
+import re
 import sys
 import queue
+import time
 import threading
 import argparse
+import subprocess
+import http.server
 from typing import Optional
+from urllib.parse import urlparse
 
 import anthropic
 
@@ -28,7 +33,7 @@ SYSTEM_PROMPT = (
     "You receive a rolling context window of recent phrases; prior translations are provided as context. "
     "Translate ONLY the latest phrase from Korean to English. "
     "Drop Korean hesitation fillers (아, 어). "
-    "Preferred terms: 여러분 → everyone. "
+    "Preferred terms: 여러분 → everyone; 정목사 → Pastor Chung. "
     "If input contains both English and Korean, keep the English as-is and translate the Korean portions into English, "
     "even if the Korean repeats or paraphrases the English — always include both. "
     "If input is entirely in English, output it unchanged. "
@@ -36,8 +41,225 @@ SYSTEM_PROMPT = (
     "Output ONLY the translation — no commentary or notes. "
     "Phrases may arrive as incomplete clauses. Translate only the words present — "
     "never infer or complete missing verbs or conclusions. "
-    "If the fragment is too incomplete or garbled, output exactly: [SKIP]"
+    "If the fragment is too incomplete or garbled, output exactly: [SKIP] "
+    "Short fragments that lack a verb or predicate and cannot stand alone as a meaningful sentence "
+    "should be [SKIP]ped — they will be prepended to the next phrase automatically. "
+    "When quoting or referencing Bible passages, use the New Korean Revised Version (개역개정) "
+    "for Korean and the English Standard Version (ESV) for English."
 )
+
+# ── Web State ─────────────────────────────────────────────────────────────────
+
+_web_state = {"lines": [], "updated": 0}
+_web_lock = threading.Lock()
+
+
+def _update_web_state(kind: str, lang: str, text: str):
+    """kind='transcription' or 'translation', lang='en'/'ko'/etc."""
+    with _web_lock:
+        _web_state["lines"].append({"kind": kind, "lang": lang, "text": text})
+        _web_state["updated"] = time.time()
+
+
+def _get_web_state_json() -> bytes:
+    with _web_lock:
+        return json.dumps(_web_state).encode()
+
+
+# ── HTML Template ─────────────────────────────────────────────────────────────
+
+CAPTION_HTML = r"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: transparent;
+    overflow: hidden;
+  }
+  #container {
+    width: 100%; height: 100%;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  #container::-webkit-scrollbar { display: none; }
+  .line-item {
+    animation: fadeIn 0.25s ease-out;
+  }
+  .span-item {
+    /* no animation — instant append for paragraph mode */
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+</style>
+</head><body>
+<div id="container">
+  <div id="lines"></div>
+</div>
+<script>
+(function() {
+  const params = new URLSearchParams(window.location.search);
+
+  // Content filtering
+  const mode    = params.get('mode')    || 'transcription';
+  const lang    = params.get('lang')    || 'en';
+  const display = params.get('display') || 'line';
+
+  // Typography
+  const fontSize   = params.get('fontSize')   || '48';
+  const fontFamily = params.get('fontFamily') || 'system-ui, sans-serif';
+  const googleFont = params.get('googleFont');
+  const fontWeight = params.get('fontWeight') || 'normal';
+  const color      = params.get('color')      || 'white';
+  const lineSpacing = params.get('lineSpacing') || '1.4';
+  const textAlign  = params.get('textAlign')  || 'left';
+  const textShadow = params.get('textShadow') || 'none';
+
+  // Layout
+  const bgColor  = params.get('bgColor') || 'transparent';
+  const padding  = params.get('padding') || '20';
+  const maxLines = Math.min(
+    params.get('maxLines') ? parseInt(params.get('maxLines')) : 0,
+    200
+  );
+
+  // Load Google Font if specified
+  if (googleFont) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family='
+              + encodeURIComponent(googleFont) + '&display=swap';
+    document.head.appendChild(link);
+  }
+
+  const container = document.getElementById('container');
+  const linesDiv  = document.getElementById('lines');
+
+  // Apply styles
+  document.body.style.background = bgColor;
+  container.style.padding = padding + 'px';
+
+  const resolvedFamily = googleFont
+    ? '"' + googleFont.replace(/\+/g, ' ') + '", ' + fontFamily
+    : fontFamily;
+  linesDiv.style.cssText = [
+    'font-size:'    + fontSize + 'px',
+    'font-family:'  + resolvedFamily,
+    'font-weight:'  + fontWeight,
+    'color:'        + color,
+    'line-height:'  + lineSpacing,
+    'text-align:'   + textAlign,
+    'text-shadow:'  + textShadow,
+  ].join(';');
+
+  let lastCount = 0;
+  let lastUpdated = 0;
+  const DOM_CAP = 200;
+
+  async function poll() {
+    try {
+      const resp = await fetch('/api/latest');
+      const data = await resp.json();
+      if (data.updated === lastUpdated) return;
+      lastUpdated = data.updated;
+
+      // Filter and append only new lines
+      const allLines = data.lines;
+      const newLines = allLines.slice(lastCount);
+      lastCount = allLines.length;
+
+      for (const line of newLines) {
+        if (line.kind !== mode) continue;
+        if (line.lang !== lang) continue;
+
+        if (display === 'paragraph') {
+          const span = document.createElement('span');
+          span.className = 'span-item';
+          span.textContent = line.text + ' ';
+          linesDiv.appendChild(span);
+        } else {
+          const div = document.createElement('div');
+          div.className = 'line-item';
+          div.textContent = line.text;
+          linesDiv.appendChild(div);
+        }
+      }
+
+      // Trim DOM
+      const selector = display === 'paragraph' ? '.span-item' : '.line-item';
+      const items = linesDiv.querySelectorAll(selector);
+      const limit = maxLines > 0 ? maxLines : DOM_CAP;
+      let toRemove = items.length - limit;
+      while (toRemove > 0) {
+        items[items.length - toRemove].remove();
+        toRemove--;
+      }
+
+      container.scrollTop = container.scrollHeight;
+    } catch (e) {}
+  }
+
+  setInterval(poll, 150);
+})();
+</script>
+</body></html>
+"""
+
+# ── HTTP Server ───────────────────────────────────────────────────────────────
+
+
+class _CaptionHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/latest":
+                data = _get_web_state_json()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+            elif parsed.path == "/":
+                html = CAPTION_HTML.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(html)
+            else:
+                self.send_error(404)
+        except BrokenPipeError:
+            pass
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_caption_server(port: int):
+    server = http.server.HTTPServer(("", port), _CaptionHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+# ── Cloudflare Tunnel ─────────────────────────────────────────────────────────
+
+
+def start_cloudflare_tunnel(tunnel_name: str, port: int):
+    """Launch cloudflared as a subprocess for a named tunnel."""
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "run", "--url", f"http://localhost:{port}", tunnel_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc
 
 
 # Get Soniox STT config.
@@ -196,6 +418,19 @@ def translate_phrase(client: anthropic.Anthropic, korean_text: str,
     return response.content[0].text.strip()
 
 
+def _push_to_web(kind: str, text: str):
+    """Parse [lang] prefix from text and push to web state."""
+    m = re.match(r"\[([a-z]{2})\]\s*", text)
+    if m:
+        lang = m.group(1)
+        raw_text = text[m.end():]
+    else:
+        lang = "en"
+        raw_text = text
+    if raw_text.strip():
+        _update_web_state(kind, lang, raw_text.strip())
+
+
 def run_session(api_key: str, device_index: int, anthropic_api_key: str) -> None:
     config = get_config(api_key)
     client = anthropic.Anthropic(api_key=anthropic_api_key)
@@ -265,13 +500,16 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str) -> None
                 text = f"[Transcription] {text}"
                 print(text)
 
+                # Push transcription to web state
+                _push_to_web("transcription", text.removeprefix("[Transcription] "))
+
                 try:
                     translation = translate_phrase(client, combined, context)
                 except Exception as e:
                     print(f"[Translation error: {e}]")
                     continue
 
-                if translation == "[SKIP]":
+                if "[SKIP]" in translation:
                     pending_text = combined
                     continue
 
@@ -280,8 +518,11 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str) -> None
                 if len(context) > 5:
                     context.pop(0)
 
-                translation = f"[Translation] {translation}"                
+                translation = f"[Translation] {translation}"
                 print(translation)
+
+                # Push translation to web state
+                _push_to_web("translation", translation.removeprefix("[Translation] "))
 
                 # Session finished.
                 if res.get("finished"):
@@ -301,6 +542,8 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str) -> None
 def main():
     parser = argparse.ArgumentParser(description="Soniox real-time Korean→English translation from microphone")
     parser.add_argument("--device", type=int, default=None, help="Audio input device index (skip interactive selection)")
+    parser.add_argument("--port", type=int, default=8080, help="Web caption server port (default: 8080, 0 to disable)")
+    parser.add_argument("--tunnel", type=str, default=None, help="Cloudflare tunnel name (e.g. church-live)")
     args = parser.parse_args()
 
     load_dotenv(override=True)
@@ -320,7 +563,22 @@ def main():
         device_index, device_name = select_audio_device()
         print(f"Using device [{device_index}]: {device_name}")
 
-    run_session(api_key, device_index, anthropic_api_key)
+    # Start web caption server
+    if args.port > 0:
+        start_caption_server(args.port)
+        print(f"Web captions: http://localhost:{args.port}")
+
+    # Start Cloudflare tunnel
+    tunnel_proc = None
+    if args.tunnel:
+        tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
+        print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
+
+    try:
+        run_session(api_key, device_index, anthropic_api_key)
+    finally:
+        if tunnel_proc:
+            tunnel_proc.terminate()
 
 
 if __name__ == "__main__":
