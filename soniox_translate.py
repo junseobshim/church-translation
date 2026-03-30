@@ -195,10 +195,9 @@ CAPTION_HTML = r"""<!DOCTYPE html>
       const selector = display === 'paragraph' ? '.span-item' : '.line-item';
       const items = linesDiv.querySelectorAll(selector);
       const limit = maxLines > 0 ? maxLines : DOM_CAP;
-      let toRemove = items.length - limit;
-      while (toRemove > 0) {
-        items[items.length - toRemove].remove();
-        toRemove--;
+      const toRemove = items.length - limit;
+      for (let i = 0; i < toRemove; i++) {
+        items[i].remove();
       }
 
       container.scrollTop = container.scrollHeight;
