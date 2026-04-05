@@ -4,19 +4,32 @@ Real-time Korean-to-English translation for church sermons using [Soniox](https:
 
 ## Prerequisites
 
-- Python 3.10+
+- macOS with [Homebrew](https://brew.sh/)
 - A [Soniox API key](https://soniox.com/) (real-time speech-to-text)
 - An [Anthropic API key](https://console.anthropic.com/) (Claude translation)
 - An audio input device (e.g. USB interface from church soundboard)
 
-## Quick Start
+## Setup
 
 ```bash
+# Install dependencies (skip any you already have)
+brew install python git portaudio
+
+# Clone the repo
 git clone https://github.com/jsshim24/church-translation.git
 cd church-translation
+
+# Create a virtual environment and install Python packages
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in SONIOX_API_KEY and ANTHROPIC_API_KEY
+
+# Configure API keys
+cp .env.example .env   # then edit .env and fill in SONIOX_API_KEY and ANTHROPIC_API_KEY
+```
+
+## Running
+
+```bash
 python3 soniox_translate.py
 ```
 
