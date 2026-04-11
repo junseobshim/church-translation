@@ -16,7 +16,7 @@ Real-time sermon translation using [Soniox](https://soniox.com/) real-time STT a
 brew install python git portaudio
 
 # Clone the repo
-git clone https://github.com/jsshim24/church-translation.git
+git clone https://github.com/junseobshim/church-translation.git
 cd church-translation
 
 # Create a virtual environment and install Python packages
