@@ -45,17 +45,18 @@ Open in any browser or ProPresenter Web Fill:
 
 | URL | What it shows |
 |-----|---------------|
-| `http://localhost:8080/` | Transcriptions, line-by-line (default) |
+| `http://localhost:8080/` | Transcriptions in the sermon's source language, line-by-line. The default `lang` filter matches whatever `--lang` the script was launched with, so no query params are needed. |
 | `http://localhost:8080/?mode=translation&lang=en` | English translations only |
 | `http://localhost:8080/?display=paragraph` | Paragraph style (for ProPresenter) |
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph` | English translations, paragraph style |
+| `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=98&fontWeight=500&lineSpacing=1.3` | English translations default for RCC Sanctuary TV display
 
 ### Query Parameters
 
 | Param | Default | Description |
 |-------|---------|-------------|
 | `mode` | `transcription` | `transcription` or `translation` |
-| `lang` | `en` | ISO 639-1 language filter (`en`, `ko`, etc.) |
+| `lang` | source language of current session | ISO 639-1 language filter. Defaults to whatever `--lang` the script was launched with. Explicit value always wins. |
 | `display` | `line` | `line` (block divs) or `paragraph` (inline spans) |
 | `fontSize` | `48` | Font size in px |
 | `fontFamily` | `system-ui, sans-serif` | CSS font stack |
@@ -65,7 +66,7 @@ Open in any browser or ProPresenter Web Fill:
 | `lineSpacing` | `1.4` | CSS line-height |
 | `textAlign` | `left` | CSS text-align |
 | `textShadow` | `none` | CSS text-shadow |
-| `bgColor` | `transparent` | Background color |
+| `bgColor` | `transparent` locally, `#000` on `live.rctranslation.org` | Background color. Explicit value always wins. |
 | `padding` | `20` | Container padding in px |
 | `maxLines` | `0` (unlimited) | Max lines displayed (hard cap 200) |
 
@@ -81,14 +82,15 @@ cloudflared tunnel create church-live
 cloudflared tunnel route dns church-live live.rctranslation.org
 ```
 
-Then run with the `--tunnel` flag:
+The tunnel starts automatically when you run the script — `--tunnel church-live` is the default. Pass `--no-tunnel` to skip it for local-only work:
 
 ```bash
-python3 soniox_translate.py --tunnel church-live
+python soniox_claude.py              # tunnel runs automatically
+python soniox_claude.py --no-tunnel  # localhost only
 ```
 
 Viewers can access:
-- `https://live.rctranslation.org/` — transcriptions (default)
+- `https://live.rctranslation.org/` — source-language transcriptions with a solid black background (default)
 - `https://live.rctranslation.org/?mode=translation&lang=en` — English translations
 
 ## CLI Options
@@ -98,7 +100,8 @@ Viewers can access:
 | `--lang {ko,en}` | `ko` | Source language: `ko` = Korean→English, `en` = English→Korean |
 | `--device N` | (interactive) | Audio input device index (skip selection prompt) |
 | `--port PORT` | `8080` | Web caption server port (`0` to disable) |
-| `--tunnel NAME` | — | Cloudflare tunnel name to start |
+| `--tunnel NAME` | `church-live` | Cloudflare tunnel name to start |
+| `--no-tunnel` | — | Skip starting the Cloudflare tunnel |
 
 ## License
 

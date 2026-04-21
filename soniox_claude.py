@@ -68,6 +68,7 @@ SYSTEM_PROMPT_EN_TO_KO = (
 
 _web_state = {"lines": [], "updated": 0}
 _web_lock = threading.Lock()
+_default_source_lang = "ko"  # set in main() from args.lang; injected into HTML
 
 
 def _update_web_state(kind: str, lang: str, text: str):
@@ -123,8 +124,9 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   const params = new URLSearchParams(window.location.search);
 
   // Content filtering
+  const DEFAULT_LANG = "__DEFAULT_LANG__";  // injected server-side from --lang
   const mode    = params.get('mode')    || 'transcription';
-  const lang    = params.get('lang')    || 'en';
+  const lang    = params.get('lang')    || DEFAULT_LANG;
   const display = params.get('display') || 'line';
 
   // Typography
@@ -138,7 +140,8 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   const textShadow = params.get('textShadow') || 'none';
 
   // Layout
-  const bgColor  = params.get('bgColor') || 'transparent';
+  const isPublic = location.hostname === 'live.rctranslation.org';
+  const bgColor  = params.get('bgColor') || (isPublic ? '#000' : 'transparent');
   const padding  = params.get('padding') || '20';
   const maxLines = Math.min(
     params.get('maxLines') ? parseInt(params.get('maxLines')) : 0,
@@ -178,10 +181,26 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   let lastUpdated = 0;
   const DOM_CAP = 200;
 
+  const FAST_MS = 150;
+  const MAX_MS  = 1000;
+  const GROWTH  = 1.5;
+  let pollDelay = FAST_MS;
+
+  const statusEl = document.createElement('div');
+  statusEl.textContent = 'Waiting for transcription…';
+  statusEl.style.cssText = 'position:fixed;bottom:16px;right:20px;font-size:14px;opacity:0;transition:opacity 0.4s;pointer-events:none;color:#999;';
+  if (isPublic) document.body.appendChild(statusEl);
+  let failCount = 0;
+  const FAIL_THRESHOLD = 3;
+
   async function poll() {
     try {
       const resp = await fetch('/api/latest');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const data = await resp.json();
+      pollDelay = FAST_MS;
+      failCount = 0;
+      statusEl.style.opacity = '0';
       if (data.updated === lastUpdated) return;
       lastUpdated = data.updated;
 
@@ -217,10 +236,16 @@ CAPTION_HTML = r"""<!DOCTYPE html>
       }
 
       container.scrollTop = container.scrollHeight;
-    } catch (e) {}
+    } catch (e) {
+      pollDelay = Math.min(pollDelay * GROWTH, MAX_MS);
+      failCount++;
+      if (isPublic && failCount >= FAIL_THRESHOLD) statusEl.style.opacity = '1';
+    } finally {
+      setTimeout(poll, pollDelay);
+    }
   }
 
-  setInterval(poll, 150);
+  poll();
 })();
 </script>
 </body></html>
@@ -242,7 +267,8 @@ class _CaptionHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
             elif parsed.path == "/":
-                html = CAPTION_HTML.encode()
+                safe_lang = _default_source_lang if _default_source_lang in ("ko", "en") else "ko"
+                html = CAPTION_HTML.replace("__DEFAULT_LANG__", safe_lang).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -603,8 +629,13 @@ def main():
                         help="Source language: ko = Korean→English (default), en = English→Korean")
     parser.add_argument("--device", type=int, default=None, help="Audio input device index (skip interactive selection)")
     parser.add_argument("--port", type=int, default=8080, help="Web caption server port (default: 8080, 0 to disable)")
-    parser.add_argument("--tunnel", type=str, default=None, help="Cloudflare tunnel name (e.g. church-live)")
+    parser.add_argument("--tunnel", type=str, default="church-live",
+                        help="Cloudflare tunnel name (default: church-live). Use --no-tunnel to skip.")
+    parser.add_argument("--no-tunnel", action="store_true", help="Skip starting the Cloudflare tunnel.")
     args = parser.parse_args()
+
+    global _default_source_lang
+    _default_source_lang = args.lang
 
     load_dotenv(override=True)
     api_key = os.environ.get("SONIOX_API_KEY")
@@ -630,7 +661,7 @@ def main():
 
     # Start Cloudflare tunnel
     tunnel_proc = None
-    if args.tunnel:
+    if args.tunnel and not args.no_tunnel:
         tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
         print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
 
