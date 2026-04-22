@@ -20,3 +20,6 @@ llms-full.txt
 
 # Cloudflare Workers
 worker/.wrangler/
+
+# Apps (for one click launch)
+*.app

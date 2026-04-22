@@ -39,6 +39,11 @@ python soniox_claude.py --lang en
 
 You'll be prompted to select an audio input device, then transcription and translation begin immediately. A web caption server starts on port 8080 by default.
 
+### Application
+Use the below script (audio device 4, default CLI flags otherwise) with Automator (Application, Run Shell Script) for one click execution (.app file, pinnable to dock)
+
+`osascript -e "tell application \"Terminal\" to do script \"cd $HOME/Documents/church-translation && source venv/bin/activate && python soniox_claude.py --device 4\""`
+
 ## Web Display
 
 Open in any browser or ProPresenter Web Fill:
@@ -93,7 +98,7 @@ Viewers can access:
 - `https://live.rctranslation.org/` — source-language transcriptions with a solid black background (default)
 - `https://live.rctranslation.org/?mode=translation&lang=en` — English translations
 
-### Waiting page (optional)
+### Waiting page
 
 When the tunnel has no origin (i.e. no device is running `soniox_claude.py`), visitors to `live.rctranslation.org` see Cloudflare's default 530 error. To replace that with a branded "Waiting for transcription…" page that auto-refreshes into captions when the tunnel comes back online, deploy the Cloudflare Worker in `worker/`. See [`worker/README.md`](worker/README.md) for the one-time deploy.
 
