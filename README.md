@@ -93,6 +93,10 @@ Viewers can access:
 - `https://live.rctranslation.org/` — source-language transcriptions with a solid black background (default)
 - `https://live.rctranslation.org/?mode=translation&lang=en` — English translations
 
+### Waiting page (optional)
+
+When the tunnel has no origin (i.e. no device is running `soniox_claude.py`), visitors to `live.rctranslation.org` see Cloudflare's default 530 error. To replace that with a branded "Waiting for transcription…" page that auto-refreshes into captions when the tunnel comes back online, deploy the Cloudflare Worker in `worker/`. See [`worker/README.md`](worker/README.md) for the one-time deploy.
+
 ## CLI Options
 
 | Flag | Default | Description |

@@ -1,0 +1,7 @@
+name = "church-waiting-room"
+main = "src/index.js"
+compatibility_date = "2026-04-21"
+
+[[routes]]
+pattern = "live.rctranslation.org/"
+zone_name = "rctranslation.org"
