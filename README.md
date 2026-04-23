@@ -39,6 +39,19 @@ python soniox_claude.py --lang en
 
 You'll be prompted to select an audio input device, then transcription and translation begin immediately. A web caption server starts on port 8080 by default.
 
+### Sermon Outline (optional)
+
+If you have the sermon outline ahead of time, pass it with `--outline` to give Claude topical and structural context. This also activates Anthropic prompt caching, making every subsequent translation call cheaper and slightly faster.
+
+```bash
+python soniox_claude.py --outline path/to/sermon.txt
+```
+
+- The file must be UTF-8 plain text. Any `.txt` with bullet points, verse references, or prose works.
+- Caching activates only when the combined system prompt + outline exceeds 1024 tokens (roughly 700–800 words). Below that, the script warns on stderr and runs without caching.
+- The cache has a 5-minute lifetime between calls. A keep-alive ping fires every 4m30s of silence so the cache survives long pauses.
+- The outline is used as **context only** — Claude is instructed to translate what is actually said, even when the speaker rhetorically diverges from the outline.
+
 ### Application
 Use the below script (audio device 4, default CLI flags otherwise) with Automator (Application, Run Shell Script) for one click execution (.app file, pinnable to dock)
 
@@ -111,6 +124,7 @@ When the tunnel has no origin (i.e. no device is running `soniox_claude.py`), vi
 | `--port PORT` | `8080` | Web caption server port (`0` to disable) |
 | `--tunnel NAME` | `church-live` | Cloudflare tunnel name to start |
 | `--no-tunnel` | — | Skip starting the Cloudflare tunnel |
+| `--outline PATH` | — | Path to a UTF-8 `.txt` sermon outline. Enables prompt caching when the combined system prompt exceeds 1024 tokens. |
 
 ## License
 

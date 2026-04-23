@@ -8,7 +8,7 @@ import threading
 import argparse
 import subprocess
 import http.server
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 import anthropic
@@ -63,6 +63,57 @@ SYSTEM_PROMPT_EN_TO_KO = (
     "Prefer formal polite speech (합쇼체/해요체) as is standard for sermon translation. "
     "When quoting or referencing Bible passages, use the New Korean Revised Version (개역개정) for Korean."
 )
+
+OUTLINE_WRAPPER = (
+    "\n\n--- SERMON OUTLINE (CONTEXT ONLY) ---\n"
+    "The following outline is provided for logical flow and topical context only. "
+    "Do NOT use it to infer, complete, or reshape what the speaker actually says. "
+    "If the spoken phrase contradicts, diverges from, or rhetorically opposes the "
+    "outline, translate what is said literally. The outline is background knowledge, "
+    "not a script.\n"
+    "--- OUTLINE BEGINS ---\n"
+    "{outline}\n"
+    "--- OUTLINE ENDS ---"
+)
+
+CACHE_MIN_TOKENS = 1024
+KEEPALIVE_IDLE_SECONDS = 270  # 4m30s; stay under the 5-minute ephemeral TTL
+KEEPALIVE_POLL_SECONDS = 10
+
+
+def load_outline(path: str) -> str:
+    """Read a UTF-8 sermon outline file. Fail loudly on any issue."""
+    if not os.path.exists(path):
+        raise RuntimeError(f"Outline file not found: {path}")
+    if os.path.isdir(path):
+        raise RuntimeError(f"Outline path is a directory, expected a file: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"Outline file is not valid UTF-8: {path} ({e})")
+    except OSError as e:
+        raise RuntimeError(f"Could not read outline file: {path} ({e})")
+    if not text.strip():
+        raise RuntimeError(f"Outline file is empty: {path}")
+    return text.strip()
+
+
+def build_system_blocks(base_prompt: str, outline: Optional[str],
+                        cache: bool) -> Union[str, list[dict]]:
+    """Assemble the system parameter for Anthropic.
+
+    No outline  -> plain string (preserves existing API shape).
+    With outline -> single TextBlockParam with optional cache_control.
+    """
+    if outline is None:
+        return base_prompt
+    combined = base_prompt + OUTLINE_WRAPPER.format(outline=outline)
+    block: dict = {"type": "text", "text": combined}
+    if cache:
+        block["cache_control"] = {"type": "ephemeral"}
+    return [block]
+
 
 # ── Web State ─────────────────────────────────────────────────────────────────
 
@@ -326,12 +377,17 @@ def get_config(api_key: str) -> dict:
             ],
             "text": "Live Korean church sermon with a pastor preaching to the congregation.",
             "terms": [
-                "하나님", "예수님", "성령", "아멘",
+                "하나님", "예수님", "성령", "아멘", "목사님", "집사님", "장로님", "권사님", "전도사님",
             ],
             "translation_terms": [
                 {"source": "하나님", "target": "God"},
                 {"source": "예수님", "target": "Jesus"},
                 {"source": "성령", "target": "the Holy Spirit"},
+                {"source": "목사님", "target": "Pastor"},
+                {"source": "집사님", "target": "Deacon"},
+                {"source": "장로님", "target": "Elder"},
+                {"source": "권사님", "target": "Deaconess"},
+                {"source": "전도사님", "target": "Pastor"},
             ],
         },
     }
@@ -475,9 +531,81 @@ def render_tokens(final_tokens: list[dict]) -> str:
     return "".join(text_parts)
 
 
+def count_system_tokens(client: anthropic.Anthropic,
+                        system: Union[str, list[dict]],
+                        model: str) -> int:
+    """Exact token count for the system parameter by differencing against a
+    baseline call with no system. Uses count_tokens (free of charge)."""
+    dummy_msg = [{"role": "user", "content": "x"}]
+    baseline = client.messages.count_tokens(model=model, messages=dummy_msg)
+    full = client.messages.count_tokens(model=model, system=system, messages=dummy_msg)
+    return full.input_tokens - baseline.input_tokens
+
+
+def check_cache_eligibility(client: anthropic.Anthropic,
+                            base_prompt: str, outline: str,
+                            model: str) -> tuple[Union[str, list[dict]], bool]:
+    """Return (system_blocks, cache_enabled). Warns and strips cache_control
+    if the combined system tokens fall below CACHE_MIN_TOKENS."""
+    candidate = build_system_blocks(base_prompt, outline, cache=True)
+    tokens = count_system_tokens(client, candidate, model)
+    if tokens >= CACHE_MIN_TOKENS:
+        print(f"Prompt caching enabled ({tokens} system tokens).")
+        return candidate, True
+    print(
+        f"Warning: system prompt + outline is {tokens} tokens, below the "
+        f"{CACHE_MIN_TOKENS}-token caching threshold. Running without cache.",
+        file=sys.stderr,
+    )
+    return build_system_blocks(base_prompt, outline, cache=False), False
+
+
+def warm_cache(client: anthropic.Anthropic,
+               system: Union[str, list[dict]], model: str) -> None:
+    """One blocking call to populate the ephemeral cache. Exits on failure so
+    an invalid API key or model name surfaces before the session starts."""
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=1,
+            system=system,
+            messages=[{"role": "user", "content": "ready"}],
+        )
+    except Exception as e:
+        sys.exit(f"Cache warmup failed: {e}")
+    written = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+    print(f"Cache warmed ({written} tokens written).")
+
+
+def keepalive_worker(client: anthropic.Anthropic,
+                     system: Union[str, list[dict]], model: str,
+                     stop_event: threading.Event,
+                     elapsed_fn, mark_fn) -> None:
+    """Touch the cache periodically during long silences so the ephemeral
+    entry doesn't expire between phrases."""
+    while not stop_event.wait(KEEPALIVE_POLL_SECONDS):
+        try:
+            if elapsed_fn() < KEEPALIVE_IDLE_SECONDS:
+                continue
+            response = client.messages.create(
+                model=model,
+                max_tokens=1,
+                system=system,
+                messages=[{"role": "user", "content": "ready"}],
+            )
+            mark_fn()
+            u = response.usage
+            cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+            cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
+            print(f"[keepalive: cache_read={cache_read} cache_write={cache_write}]",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"[keepalive error: {e}]", file=sys.stderr)
+
+
 def translate_phrase(client: anthropic.Anthropic, korean_text: str,
                      context: list[tuple[str, str]], model: str = DEFAULT_MODEL,
-                     system_prompt: str = SYSTEM_PROMPT) -> str:
+                     system: Union[str, list[dict]] = SYSTEM_PROMPT) -> str:
     messages = []
     for speaker, translation in context:
         messages.append({"role": "user", "content": speaker})
@@ -487,9 +615,14 @@ def translate_phrase(client: anthropic.Anthropic, korean_text: str,
     response = client.messages.create(
         model=model,
         max_tokens=1024,
-        system=system_prompt,
+        system=system,
         messages=messages,
     )
+    u = response.usage
+    cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+    cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
+    print(f"[usage: in={u.input_tokens} cache_read={cache_read} "
+          f"cache_write={cache_write} out={u.output_tokens}]", file=sys.stderr)
     return response.content[0].text.strip()
 
 
@@ -507,17 +640,36 @@ def _push_to_web(kind: str, text: str, fallback_lang: str = "en"):
 
 
 def run_session(api_key: str, device_index: int, anthropic_api_key: str,
-                lang: str = "ko") -> None:
+                lang: str = "ko", outline: Optional[str] = None) -> None:
     if lang == "en":
         config = get_config_en_to_ko(api_key)
-        system_prompt = SYSTEM_PROMPT_EN_TO_KO
+        base_prompt = SYSTEM_PROMPT_EN_TO_KO
         fallback_lang = "ko"
     else:
         config = get_config(api_key)
-        system_prompt = SYSTEM_PROMPT
+        base_prompt = SYSTEM_PROMPT
         fallback_lang = "en"
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     context: list[tuple[str, str]] = []
+
+    if outline is None:
+        system: Union[str, list[dict]] = base_prompt
+        cache_enabled = False
+    else:
+        system, cache_enabled = check_cache_eligibility(client, base_prompt, outline, DEFAULT_MODEL)
+        if cache_enabled:
+            warm_cache(client, system, DEFAULT_MODEL)
+
+    activity_lock = threading.Lock()
+    last_activity = [time.monotonic()]
+
+    def mark_activity():
+        with activity_lock:
+            last_activity[0] = time.monotonic()
+
+    def seconds_since_activity() -> float:
+        with activity_lock:
+            return time.monotonic() - last_activity[0]
 
     print("Connecting to Soniox...")
     with connect(SONIOX_WEBSOCKET_URL) as ws:
@@ -532,6 +684,16 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str,
             daemon=True,
         )
         audio_thread.start()
+
+        keepalive_thread: Optional[threading.Thread] = None
+        if cache_enabled:
+            keepalive_thread = threading.Thread(
+                target=keepalive_worker,
+                args=(client, system, DEFAULT_MODEL, stop_event,
+                      seconds_since_activity, mark_activity),
+                daemon=True,
+            )
+            keepalive_thread.start()
 
         print("Session started. Speak into your microphone. Press Ctrl+C to stop.")
 
@@ -588,10 +750,12 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str,
 
                 try:
                     translation = translate_phrase(client, combined, context,
-                                                   system_prompt=system_prompt)
+                                                   system=system)
                 except Exception as e:
                     print(f"[Translation error: {e}]")
                     continue
+                finally:
+                    mark_activity()
 
                 if "[SKIP]" in translation:
                     pending_text = combined
@@ -632,7 +796,16 @@ def main():
     parser.add_argument("--tunnel", type=str, default="church-live",
                         help="Cloudflare tunnel name (default: church-live). Use --no-tunnel to skip.")
     parser.add_argument("--no-tunnel", action="store_true", help="Skip starting the Cloudflare tunnel.")
+    parser.add_argument("--outline", type=str, default=None,
+                        help="Path to a UTF-8 .txt sermon outline for context. "
+                             "Enables prompt caching when the combined system prompt "
+                             "exceeds 1024 tokens.")
     args = parser.parse_args()
+
+    outline_text: Optional[str] = None
+    if args.outline is not None:
+        outline_text = load_outline(args.outline)
+        print(f"Loaded outline: {args.outline} ({len(outline_text)} chars)")
 
     global _default_source_lang
     _default_source_lang = args.lang
@@ -668,7 +841,8 @@ def main():
     try:
         direction = "Korean→English" if args.lang == "ko" else "English→Korean"
         print(f"Translation mode: {direction}")
-        run_session(api_key, device_index, anthropic_api_key, lang=args.lang)
+        run_session(api_key, device_index, anthropic_api_key,
+                    lang=args.lang, outline=outline_text)
     finally:
         if tunnel_proc:
             tunnel_proc.terminate()
