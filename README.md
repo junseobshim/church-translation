@@ -1,6 +1,6 @@
 # Live Church Sermon Translation
 
-Real-time sermon translation using [Soniox](https://soniox.com/) real-time STT and [Claude](https://anthropic.com/) for translation, with a built-in web display for ProPresenter or any browser. Supports Korean→English and English→Korean.
+Real-time sermon translation using [Soniox](https://soniox.com/) real-time STT and [Claude](https://anthropic.com/) for translation, with a built-in web display for ProPresenter or any browser. Supports Korean, English, and Spanish — in any source/target combination, including multilingual (ko+en+es) sermons. Each translation target runs on its own parallel worker, so one Korean phrase can be translated into English and Spanish simultaneously on separate URLs.
 
 ## Prerequisites
 
@@ -30,14 +30,25 @@ cp .env.example .env   # then edit .env and fill in SONIOX_API_KEY and ANTHROPIC
 ## Running
 
 ```bash
-# Korean → English (default)
+# Korean (mixed with English) → English  (default)
 python soniox_claude.py
 
 # English → Korean
-python soniox_claude.py --lang en
+python soniox_claude.py --source en --target ko
+
+# Korean → English AND Spanish (parallel translation streams on separate URLs)
+python soniox_claude.py --source ko --target en,es
+
+# Spanish (mixed with English) → English
+python soniox_claude.py --source es --target en
+
+# Multilingual (ko + en + es speech) → all three translation streams
+python soniox_claude.py --source multi
 ```
 
 You'll be prompted to select an audio input device, then transcription and translation begin immediately. A web caption server starts on port 8080 by default.
+
+`--source` picks Soniox's strict language hints: `ko` → `[ko, en]`, `en` → `[en]`, `es` → `[es, en]`, `multi` → `[ko, en, es]`. `--target` accepts a comma-separated subset of `{ko, en, es}` minus the source; `--source multi` is fixed at `--target ko,en,es`. `--target` is required for `--source en` and `--source es`; defaults exist only for `ko` (→ `en`) and `multi` (→ `ko,en,es`).
 
 ### Sermon Outline (optional)
 
@@ -47,8 +58,9 @@ If you have the sermon outline ahead of time, pass it with `--outline` to give C
 python soniox_claude.py --outline path/to/sermon.txt
 ```
 
-- The file must be UTF-8 plain text. Any `.txt` with bullet points, verse references, or prose works.
+- The file must be UTF-8 plain text. Any `.txt` with bullet points, verse references, or prose works. For a multilingual sermon, use a single multilingual outline; it is attached verbatim to every target worker's system prompt.
 - Caching activates only when the combined system prompt + outline exceeds 1024 tokens (roughly 700–800 words). Below that, the script warns on stderr and runs without caching.
+- With multiple `--target` languages, each target worker caches its own system-prompt + outline independently and has its own keep-alive ping. Expect one `Cache warmed` message per cached worker at startup.
 - The cache has a 5-minute lifetime between calls. A keep-alive ping fires every 4m30s of silence so the cache survives long pauses.
 - The outline is used as **context only** — Claude is instructed to translate what is actually said, even when the speaker rhetorically diverges from the outline.
 
@@ -57,24 +69,30 @@ Use the below script (audio device 4, default CLI flags otherwise) with Automato
 
 `osascript -e "tell application \"Terminal\" to do script \"cd $HOME/Documents/church-translation && source venv/bin/activate && python soniox_claude.py --device 4\""`
 
+Duplicate and edit the `.app` for other source/target combinations (e.g. `--source es --target en` for a Spanish service).
+
 ## Web Display
 
 Open in any browser or ProPresenter Web Fill:
 
 | URL | What it shows |
 |-----|---------------|
-| `http://localhost:8080/` | Transcriptions in the sermon's source language, line-by-line. The default `lang` filter matches whatever `--lang` the script was launched with, so no query params are needed. |
+| `http://localhost:8080/` | All transcription lines, regardless of detected language (Korean, English, Spanish as spoken). No query params needed. |
+| `http://localhost:8080/?mode=translation` | Translations in the default target (the first `--target`). |
 | `http://localhost:8080/?mode=translation&lang=en` | English translations only |
+| `http://localhost:8080/?mode=translation&lang=ko` | Korean translations only |
+| `http://localhost:8080/?mode=translation&lang=es` | Spanish translations only |
 | `http://localhost:8080/?display=paragraph` | Paragraph style (for ProPresenter) |
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph` | English translations, paragraph style |
-| `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=98&fontWeight=500&lineSpacing=1.3` | English translations default for RCC Sanctuary TV display
+| `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=98&fontWeight=500&lineSpacing=1.3` | English translations default for RCC Sanctuary TV display |
+| `http://localhost:8080/?mode=transcription&lang=ko` | Only Korean transcription segments (explicit filter on the transcription stream) |
 
 ### Query Parameters
 
 | Param | Default | Description |
 |-------|---------|-------------|
 | `mode` | `transcription` | `transcription` or `translation` |
-| `lang` | source language of current session | ISO 639-1 language filter. Defaults to whatever `--lang` the script was launched with. Explicit value always wins. |
+| `lang` | first `--target` for translation mode; no filter for transcription mode | ISO 639-1 language filter. In transcription mode, omitting `lang` shows all languages as spoken; in translation mode it defaults to the first `--target`. Explicit value always wins. |
 | `display` | `line` | `line` (block divs) or `paragraph` (inline spans) |
 | `fontSize` | `48` | Font size in px |
 | `fontFamily` | `system-ui, sans-serif` | CSS font stack |
@@ -108,8 +126,10 @@ python soniox_claude.py --no-tunnel  # localhost only
 ```
 
 Viewers can access:
-- `https://live.rctranslation.org/` — source-language transcriptions with a solid black background (default)
+- `https://live.rctranslation.org/` — all transcription lines, regardless of language, with a solid black background (default)
 - `https://live.rctranslation.org/?mode=translation&lang=en` — English translations
+- `https://live.rctranslation.org/?mode=translation&lang=ko` — Korean translations
+- `https://live.rctranslation.org/?mode=translation&lang=es` — Spanish translations
 
 ### Waiting page
 
@@ -119,12 +139,13 @@ When the tunnel has no origin (i.e. no device is running `soniox_claude.py`), vi
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--lang {ko,en}` | `ko` | Source language: `ko` = Korean→English, `en` = English→Korean |
+| `--source {ko,en,es,multi}` | `ko` | Source language. `ko` = Korean + English, `en` = English only, `es` = Spanish + English, `multi` = Korean + English + Spanish. Sets Soniox's strict language hints. |
+| `--target CSV` | `en` when `--source ko`, `ko,en,es` when `--source multi`; required otherwise | Comma-separated translation targets. Must be a non-empty subset of `{ko,en,es}` excluding `--source`. For `--source multi`, must be exactly `ko,en,es`. Each target runs as its own parallel Claude worker. |
 | `--device N` | (interactive) | Audio input device index (skip selection prompt) |
 | `--port PORT` | `8080` | Web caption server port (`0` to disable) |
 | `--tunnel NAME` | `church-live` | Cloudflare tunnel name to start |
 | `--no-tunnel` | — | Skip starting the Cloudflare tunnel |
-| `--outline PATH` | — | Path to a UTF-8 `.txt` sermon outline. Enables prompt caching when the combined system prompt exceeds 1024 tokens. |
+| `--outline PATH` | — | Path to a UTF-8 `.txt` sermon outline. Enables per-target prompt caching when the combined system prompt exceeds 1024 tokens. |
 
 ## License
 
