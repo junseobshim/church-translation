@@ -29,7 +29,25 @@ const WAITING_HTML = `<!DOCTYPE html>
 })();
 </script></body></html>`;
 
-const waitingResponse = () => new Response(WAITING_HTML, {
+const HIDDEN_HTML = `<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<style>html,body{margin:0;height:100%;background:transparent}</style>
+</head><body>
+<script>
+(function(){
+  async function check(){
+    try{
+      const r = await fetch('/api/latest', {cache:'no-store'});
+      if (r.ok) { location.reload(); return; }
+    } catch(e) {}
+    setTimeout(check, 1000);
+  }
+  check();
+})();
+</script></body></html>`;
+
+const waitingResponse = (hideStatus) => new Response(hideStatus ? HIDDEN_HTML : WAITING_HTML, {
   status: 200,
   headers: {
     'Content-Type': 'text/html; charset=utf-8',
@@ -44,13 +62,15 @@ export default {
     // query string" directly. Non-root paths pass through unchanged; `/api/*` is
     // additionally exempted from Workers via a Dashboard-configured route (see
     // worker/README.md) so polling traffic doesn't consume free-tier invocations.
-    if (new URL(request.url).pathname !== '/') return fetch(request);
+    const url = new URL(request.url);
+    if (url.pathname !== '/') return fetch(request);
+    const hideStatus = url.searchParams.get('hideStatus') === '1';
     try {
       const resp = await fetch(request);
-      if (resp.status >= 500) return waitingResponse();
+      if (resp.status >= 500) return waitingResponse(hideStatus);
       return resp;
     } catch (e) {
-      return waitingResponse();
+      return waitingResponse(hideStatus);
     }
   },
 };

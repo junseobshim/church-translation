@@ -279,8 +279,8 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   const textShadow = params.get('textShadow') || 'none';
 
   // Layout
-  const isPublic = location.hostname === 'live.rctranslation.org';
-  const bgColor  = params.get('bgColor') || (isPublic ? '#000' : 'transparent');
+  const bgColor  = params.get('bgColor') || '#000';
+  const showStatus = params.get('hideStatus') !== '1';
   const padding  = params.get('padding') || '20';
   const maxLines = Math.min(
     params.get('maxLines') ? parseInt(params.get('maxLines')) : 0,
@@ -328,7 +328,7 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   const statusEl = document.createElement('div');
   statusEl.textContent = 'Waiting for transcription…';
   statusEl.style.cssText = 'position:fixed;bottom:16px;right:20px;font-size:14px;opacity:0;transition:opacity 0.4s;pointer-events:none;color:#999;';
-  if (isPublic) document.body.appendChild(statusEl);
+  if (showStatus) document.body.appendChild(statusEl);
   let failCount = 0;
   const FAIL_THRESHOLD = 3;
 
@@ -378,7 +378,7 @@ CAPTION_HTML = r"""<!DOCTYPE html>
     } catch (e) {
       pollDelay = Math.min(pollDelay * GROWTH, MAX_MS);
       failCount++;
-      if (isPublic && failCount >= FAIL_THRESHOLD) statusEl.style.opacity = '1';
+      if (showStatus && failCount >= FAIL_THRESHOLD) statusEl.style.opacity = '1';
     } finally {
       setTimeout(poll, pollDelay);
     }

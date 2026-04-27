@@ -2,6 +2,8 @@
 
 Serves a "Waiting for transcription…" page on `https://live.rctranslation.org/` whenever the tunnel has no healthy origin (i.e. `soniox_claude.py` isn't running). Auto-reloads into live captions as soon as the tunnel comes back online.
 
+Pass `?hideStatus=1` (e.g. for ProPresenter web fill) to swap the visible waiting page for a transparent silent-polling stub — same auto-reload behavior, no spinner painted on the projection during downtime.
+
 ## Deploy (one-time)
 
 ```bash

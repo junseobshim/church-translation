@@ -84,7 +84,7 @@ Open in any browser or ProPresenter Web Fill:
 | `http://localhost:8080/?mode=translation&lang=es` | Spanish translations only |
 | `http://localhost:8080/?display=paragraph` | Paragraph style (for ProPresenter) |
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph` | English translations, paragraph style |
-| `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=98&fontWeight=500&lineSpacing=1.3` | English translations default for RCC Sanctuary TV display |
+| `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=98&fontWeight=500&lineSpacing=1.3&bgColor=transparent&hideStatus=1` | English translations default for RCC Sanctuary TV display (ProPresenter web fill — transparent overlay, no status indicator) |
 | `http://localhost:8080/?mode=transcription&lang=ko` | Only Korean transcription segments (explicit filter on the transcription stream) |
 
 ### Query Parameters
@@ -102,7 +102,8 @@ Open in any browser or ProPresenter Web Fill:
 | `lineSpacing` | `1.4` | CSS line-height |
 | `textAlign` | `left` | CSS text-align |
 | `textShadow` | `none` | CSS text-shadow |
-| `bgColor` | `transparent` locally, `#000` on `live.rctranslation.org` | Background color. Explicit value always wins. |
+| `bgColor` | `#000` | Background color. Pass `bgColor=transparent` for ProPresenter web fill. |
+| `hideStatus` | `0` | Set to `1` to suppress the bottom-right "Waiting for transcription…" connection indicator. Use for ProPresenter web fill so the indicator never paints on the projection. |
 | `padding` | `20` | Container padding in px |
 | `maxLines` | `0` (unlimited) | Max lines displayed (hard cap 200) |
 
@@ -111,12 +112,14 @@ Open in any browser or ProPresenter Web Fill:
 To make the web display accessible over the internet (e.g. at `live.rctranslation.org`):
 
 ```bash
-# One-time setup
+# One-time setup (see below for steps regarding tunnel credentials)
 brew install cloudflared
 cloudflared tunnel login
-cloudflared tunnel create church-live
-cloudflared tunnel route dns church-live live.rctranslation.org
 ```
+
+Copy the .json file (`~/.cloudflared/` on an existing installation) associated with the church-live tunnel onto the new device.
+
+Alternatively, regenerate the credentials through the Cloudflare dashboard (Networking -> Tunnels -> Rotate token).
 
 The tunnel starts automatically when you run the script — `--tunnel church-live` is the default. Pass `--no-tunnel` to skip it for local-only work:
 
