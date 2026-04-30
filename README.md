@@ -149,6 +149,23 @@ When the tunnel has no origin (i.e. no device is running `soniox_claude.py`), vi
 | `--tunnel NAME` | `church-live` | Cloudflare tunnel name to start |
 | `--no-tunnel` | — | Skip starting the Cloudflare tunnel |
 | `--outline PATH` | — | Path to a UTF-8 `.txt` sermon outline. Enables per-target prompt caching when the combined system prompt exceeds 1024 tokens. |
+| `--transcriber {soniox}` | `soniox` | Transcription backend. Loads `transcribe_<name>.py` at startup. More options will be added as alternative backends land (e.g. `mlx-whisper`, `azure`). |
+| `--translator {claude}` | `claude` | Translation backend. Loads `translate_<name>.py` at startup. More options will be added as alternative backends land (e.g. `qwen-mlx`, `gemini`). |
+
+## Architecture
+
+The codebase splits into a shared shell plus per-backend modules:
+
+- **`soniox_claude.py`** — shared infrastructure: audio capture, web caption server, Cloudflare tunnel, prompt-building scaffolding, the LLM-agnostic `TranslationWorker` (queue/`[SKIP]`/rolling context), orchestration, and CLI. It loads the requested transcription and translation modules lazily via `importlib`, so a deployment using only e.g. `azure` + `gemini` backends would not pull in `websockets` or `anthropic`.
+- **`transcribe_soniox.py`** — Soniox transcription backend: WebSocket session, audio pump, recv/gating loop, term lists, and the `[Transcription]` print. Imports `websockets`.
+- **`translate_claude.py`** — Claude translation backend: per-target system prompt, ephemeral cache eligibility check, cache warmup, keepalive thread, and the `messages.create` translation call. Imports `anthropic`.
+
+Alternative backends drop in alongside without modifying the main file beyond extending the `--transcriber` / `--translator` choice lists. They must implement these contracts:
+
+- `Transcriber(source, api_key)` with `run(device_index, on_phrase, stop_event)` — blocking; calls `on_phrase(text)` once per finalized phrase and prints `[Transcription] {text}` itself.
+- `Backend` with `from_outline(client, source, target, outline, model)` classmethod plus `warmup()`, `translate(context, latest)`, `mark_activity()`, and `start_keepalive(stop_event)` instance methods. Module-level `make_client(api_key)` factory and `DEFAULT_MODEL` constant.
+
+`websockets` is Soniox-only and `anthropic` is Claude-only at the import level — both are still required for the default Soniox + Claude path. Once optional backends ship, `requirements.txt` may split into extras keyed by backend.
 
 ## License
 

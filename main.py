@@ -8,33 +8,21 @@ import threading
 import argparse
 import subprocess
 import http.server
-from typing import Callable, Optional, Union
+import importlib
+from typing import Callable, Optional
 from urllib.parse import urlparse
-
-import anthropic
 
 # Suppress noisy thread exception tracebacks on Ctrl+C.
 threading.excepthook = lambda args: None
 
 import sounddevice as sd
 from dotenv import load_dotenv
-from websockets import ConnectionClosedOK
-from websockets.sync.client import connect
 
 
-# ── STT constants ─────────────────────────────────────────────────────────────
+# ── Audio constants ───────────────────────────────────────────────────────────
 
-SONIOX_WEBSOCKET_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 SAMPLE_RATE = 16000
 CHUNK_FRAMES = 1600  # 100ms at 16kHz
-
-
-# ── Claude constants ──────────────────────────────────────────────────────────
-
-DEFAULT_MODEL = "claude-sonnet-4-6"
-CACHE_MIN_TOKENS = 1024
-KEEPALIVE_IDLE_SECONDS = 270  # 4m30s; stay under the 5-minute ephemeral TTL
-KEEPALIVE_POLL_SECONDS = 10
 
 
 # ── Shared language constants ─────────────────────────────────────────────────
@@ -134,22 +122,6 @@ def load_outline(path: str) -> str:
     if not text.strip():
         raise RuntimeError(f"Outline file is empty: {path}")
     return text.strip()
-
-
-def build_system_blocks(base_prompt: str, outline: Optional[str],
-                        cache: bool) -> Union[str, list[dict]]:
-    """Assemble the system parameter for Anthropic.
-
-    No outline  -> plain string (preserves existing API shape).
-    With outline -> single TextBlockParam with optional cache_control.
-    """
-    if outline is None:
-        return base_prompt
-    combined = base_prompt + OUTLINE_WRAPPER.format(outline=outline)
-    block: dict = {"type": "text", "text": combined}
-    if cache:
-        block["cache_control"] = {"type": "ephemeral"}
-    return [block]
 
 
 def build_prompt(source: str, target: str) -> str:
@@ -443,65 +415,6 @@ def start_cloudflare_tunnel(tunnel_name: str, port: int):
     return proc
 
 
-# ── Soniox Config ─────────────────────────────────────────────────────────────
-
-TERMS_KO = ["하나님", "예수님", "성령", "아멘", "목사님", "집사님", "장로님", "권사님", "전도사님"]
-TERMS_EN = ["God", "Jesus", "Holy Spirit", "amen", "Pastor"]
-TERMS_ES = ["Dios", "Jesús", "Cristo", "Espíritu Santo", "amén", "Pastor", "hermano", "hermana", "iglesia"]
-
-SOURCE_TERMS = {
-    "ko":    TERMS_KO + TERMS_EN,
-    "en":    TERMS_EN,
-    "es":    TERMS_ES + TERMS_EN,
-    "multi": TERMS_KO + TERMS_EN + TERMS_ES,
-}
-
-SOURCE_CONTEXT = {
-    "ko":    ("Korean church sermon",
-              "Live Korean church sermon with occasional English, with a pastor preaching to the congregation."),
-    "en":    ("English church sermon",
-              "Live English church sermon with a pastor preaching to the congregation."),
-    "es":    ("Spanish church sermon",
-              "Live Spanish church sermon with occasional English, with a pastor preaching to the congregation."),
-    "multi": ("Multilingual church sermon",
-              "Live multilingual church sermon in Korean, English, and Spanish, with a pastor preaching to the congregation."),
-}
-
-
-def build_soniox_config(source: str, api_key: str) -> dict:
-    """Build the initial-frame JSON for the Soniox STT websocket.
-
-    `translation.target_language` is fixed at `zh` across all sources — Soniox
-    translation tokens are used only as a phrase-boundary gating signal; the
-    translated text is discarded. Pivoting to an unused language keeps this
-    config source-agnostic.
-    """
-    topic, text = SOURCE_CONTEXT[source]
-    return {
-        "api_key": api_key,
-        "model": "stt-rt-v4",
-        "language_hints": SOURCE_LANGS[source],
-        "language_hints_strict": True,
-        "enable_language_identification": True,
-        "enable_endpoint_detection": True,
-        "audio_format": "pcm_s16le",
-        "sample_rate": SAMPLE_RATE,
-        "num_channels": 1,
-        "translation": {
-            "type": "one_way",
-            "target_language": "zh",
-        },
-        "context": {
-            "general": [
-                {"key": "domain", "value": "Religion"},
-                {"key": "topic", "value": topic},
-            ],
-            "text": text,
-            "terms": SOURCE_TERMS[source],
-        },
-    }
-
-
 # ── Audio ─────────────────────────────────────────────────────────────────────
 
 
@@ -536,9 +449,13 @@ def select_audio_device():
             print("  Invalid device index. Try again.")
 
 
-def stream_audio(device_index: int, ws, stop_event: threading.Event) -> None:
-    """Stream microphone audio to the Soniox websocket."""
-    audio_queue = queue.Queue()
+def iter_audio_chunks(device_index: int, sample_rate: int, chunk_frames: int,
+                      stop_event: threading.Event):
+    """Yield raw int16 PCM chunks from the mic until stop_event fires.
+
+    Pure mic-capture; transport is the caller's responsibility.
+    """
+    audio_queue: queue.Queue = queue.Queue()
 
     def callback(indata, frames, time_info, status):
         if status:
@@ -546,8 +463,8 @@ def stream_audio(device_index: int, ws, stop_event: threading.Event) -> None:
         audio_queue.put(bytes(indata))
 
     stream = sd.RawInputStream(
-        samplerate=SAMPLE_RATE,
-        blocksize=CHUNK_FRAMES,
+        samplerate=sample_rate,
+        blocksize=chunk_frames,
         device=device_index,
         dtype="int16",
         channels=1,
@@ -561,157 +478,46 @@ def stream_audio(device_index: int, ws, stop_event: threading.Event) -> None:
                     chunk = audio_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                ws.send(chunk)
+                yield chunk
     except Exception:
         pass
-
-    # Empty string signals end-of-audio to the server.
-    try:
-        ws.send("")
-    except Exception:
-        pass
-
-
-# ── Token Rendering ───────────────────────────────────────────────────────────
-
-
-def render_tokens(final_tokens: list[dict]) -> str:
-    """Convert Soniox tokens into a readable transcript, interleaving [xx] tags
-    on language changes."""
-    text_parts: list[str] = []
-    current_speaker: Optional[str] = None
-    current_language: Optional[str] = None
-
-    for token in final_tokens:
-        text = token["text"]
-        if text == "<end>":
-            continue
-        speaker = token.get("speaker")
-        language = token.get("language")
-        is_translation = token.get("translation_status") == "translation"
-
-        if language is not None and language != current_language:
-            if text_parts and not text_parts[-1].endswith(" "):
-                text_parts.append(" ")
-            current_language = language
-            prefix = "[Translation] " if is_translation else ""
-            text_parts.append(f"{prefix}[{current_language}] ")
-            text = text.lstrip()
-
-        text_parts.append(text)
-
-    return "".join(text_parts)
-
-
-# ── Claude Caching ────────────────────────────────────────────────────────────
-
-
-def count_system_tokens(client: anthropic.Anthropic,
-                        system: Union[str, list[dict]],
-                        model: str) -> int:
-    """Exact token count for the system parameter by differencing against a
-    baseline call with no system. Uses count_tokens (free of charge)."""
-    dummy_msg = [{"role": "user", "content": "x"}]
-    baseline = client.messages.count_tokens(model=model, messages=dummy_msg)
-    full = client.messages.count_tokens(model=model, system=system, messages=dummy_msg)
-    return full.input_tokens - baseline.input_tokens
-
-
-def check_cache_eligibility(client: anthropic.Anthropic,
-                            base_prompt: str, outline: str, model: str,
-                            label: str = "") -> tuple[Union[str, list[dict]], bool]:
-    """Return (system_blocks, cache_enabled). Warns and strips cache_control
-    if the combined system tokens fall below CACHE_MIN_TOKENS. The optional
-    `label` is included in log output to distinguish per-target workers."""
-    candidate = build_system_blocks(base_prompt, outline, cache=True)
-    tokens = count_system_tokens(client, candidate, model)
-    tag = f" [{label}]" if label else ""
-    if tokens >= CACHE_MIN_TOKENS:
-        print(f"Prompt caching enabled{tag} ({tokens} system tokens).")
-        return candidate, True
-    print(
-        f"Warning: system prompt + outline is {tokens} tokens{tag}, below the "
-        f"{CACHE_MIN_TOKENS}-token caching threshold. Running without cache.",
-        file=sys.stderr,
-    )
-    return build_system_blocks(base_prompt, outline, cache=False), False
-
-
-def warm_cache(client: anthropic.Anthropic,
-               system: Union[str, list[dict]], model: str,
-               label: str = "") -> None:
-    """One blocking call to populate the ephemeral cache. Exits on failure so
-    an invalid API key or model name surfaces before the session starts."""
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=1,
-            system=system,
-            messages=[{"role": "user", "content": "ready"}],
-        )
-    except Exception as e:
-        sys.exit(f"Cache warmup failed: {e}")
-    written = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-    tag = f" [{label}]" if label else ""
-    print(f"Cache warmed{tag} ({written} tokens written).")
 
 
 # ── Translation Worker ────────────────────────────────────────────────────────
 
 
 class TranslationWorker:
-    """Owns one target-language translation stream.
+    """LLM-agnostic queue/[SKIP]/rolling-context shell for one target language.
 
-    State per worker: Claude client handle (shared), system prompt (own),
-    cache flag (own), rolling context window (own), `[SKIP]` pending-text
-    buffer (own), input queue (own), and (if cached) a keepalive thread (own).
-    The only external seam is the `on_translation(target, text)` callback
-    passed at construction — the callee decides how to surface the output
-    (e.g. push to web state). This keeps the class language-neutral and
-    trivially movable to a future `translate_claude.py` module.
+    State per worker: rolling context window (own), `[SKIP]` pending-text
+    buffer (own), input queue (own), and a backend (Claude/Gemini/etc.) that
+    owns the actual translation API call, cache, and keepalive. The only
+    external seam is the `on_translation(target, text)` callback passed at
+    construction — the callee decides how to surface the output (e.g. push
+    to web state).
     """
 
-    def __init__(self, client: anthropic.Anthropic, source: str, target: str,
-                 system_blocks: Union[str, list[dict]], cache_enabled: bool,
-                 model: str, stop_event: threading.Event,
+    def __init__(self, backend, source: str, stop_event: threading.Event,
                  on_translation: Callable[[str, str], None]):
-        self.client = client
+        self.backend = backend
         self.source = source
-        self.target = target
-        self.system = system_blocks
-        self.cache_enabled = cache_enabled
-        self.model = model
         self.stop_event = stop_event
         self.on_translation = on_translation
         self.inbox: queue.Queue[str] = queue.Queue()
         self.context: list[tuple[str, str]] = []   # last 5 (source, translation)
         self.pending_text: str = ""
-        self._last_activity = time.monotonic()
-        self._activity_lock = threading.Lock()
         self._run_thread: Optional[threading.Thread] = None
-        self._keepalive_thread: Optional[threading.Thread] = None
 
     def warm(self) -> None:
-        if self.cache_enabled:
-            warm_cache(self.client, self.system, self.model, label=self.target)
+        self.backend.warmup()
 
     def start(self) -> None:
         self._run_thread = threading.Thread(target=self._run, daemon=True)
         self._run_thread.start()
-        if self.cache_enabled:
-            self._keepalive_thread = threading.Thread(target=self._keepalive, daemon=True)
-            self._keepalive_thread.start()
+        self.backend.start_keepalive(self.stop_event)
 
     def enqueue(self, source_text: str) -> None:
         self.inbox.put(source_text)
-
-    def _mark(self) -> None:
-        with self._activity_lock:
-            self._last_activity = time.monotonic()
-
-    def _idle_seconds(self) -> float:
-        with self._activity_lock:
-            return time.monotonic() - self._last_activity
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -724,12 +530,11 @@ class TranslationWorker:
                 continue
             combined = (self.pending_text + " " + clean_src).strip() if self.pending_text else clean_src
             try:
-                out = self._call(combined)
+                out = self.backend.translate(self.context, combined)
             except Exception as e:
-                print(f"[{self.target} translation error: {e}]", file=sys.stderr)
-                self._mark()
+                print(f"[{self.backend.target} translation error: {e}]", file=sys.stderr)
+                self.backend.mark_activity()
                 continue
-            self._mark()
             if "[SKIP]" in out:
                 self.pending_text = combined
                 continue
@@ -737,75 +542,25 @@ class TranslationWorker:
             self.context.append((combined, out))
             if len(self.context) > 5:
                 self.context.pop(0)
-            prefixed = f"[{self.target}] {out}"
-            print(f"[Translation:{self.target}] {prefixed}")
-            self.on_translation(self.target, prefixed)
-
-    def _call(self, text: str) -> str:
-        messages: list[dict] = []
-        for s, t in self.context:
-            messages.append({"role": "user", "content": s})
-            messages.append({"role": "assistant", "content": t})
-        messages.append({"role": "user", "content": text})
-        resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=self.system,
-            messages=messages,
-        )
-        u = resp.usage
-        cr = getattr(u, "cache_read_input_tokens", 0) or 0
-        cw = getattr(u, "cache_creation_input_tokens", 0) or 0
-        print(f"[usage {self.target}: in={u.input_tokens} cache_read={cr} "
-              f"cache_write={cw} out={u.output_tokens}]", file=sys.stderr)
-        return resp.content[0].text.strip()
-
-    def _keepalive(self) -> None:
-        while not self.stop_event.wait(KEEPALIVE_POLL_SECONDS):
-            try:
-                if self._idle_seconds() < KEEPALIVE_IDLE_SECONDS:
-                    continue
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=1,
-                    system=self.system,
-                    messages=[{"role": "user", "content": "ready"}],
-                )
-                self._mark()
-                u = response.usage
-                cr = getattr(u, "cache_read_input_tokens", 0) or 0
-                cw = getattr(u, "cache_creation_input_tokens", 0) or 0
-                print(f"[keepalive {self.target}: cache_read={cr} cache_write={cw}]",
-                      file=sys.stderr)
-            except Exception as e:
-                print(f"[keepalive {self.target} error: {e}]", file=sys.stderr)
+            prefixed = f"[{self.backend.target}] {out}"
+            print(f"[Translation:{self.backend.target}] {prefixed}")
+            self.on_translation(self.backend.target, prefixed)
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 
-def _build_workers(client: anthropic.Anthropic, source: str, targets: list[str],
-                   outline: Optional[str], stop_event: threading.Event
-                   ) -> list[TranslationWorker]:
+def _build_workers(client, source: str, targets: list[str],
+                   outline: Optional[str], stop_event: threading.Event,
+                   model: str, backend_cls) -> list[TranslationWorker]:
     """Construct one TranslationWorker per target. Per-worker cache eligibility
-    is decided independently (each has its own system prompt)."""
+    is decided independently inside backend_cls.from_outline."""
     workers: list[TranslationWorker] = []
     for t in targets:
-        prompt = build_prompt(source, t)
-        if outline is None:
-            system: Union[str, list[dict]] = prompt
-            cache_enabled = False
-        else:
-            system, cache_enabled = check_cache_eligibility(
-                client, prompt, outline, DEFAULT_MODEL, label=t
-            )
+        backend = backend_cls.from_outline(client, source, t, outline, model)
         w = TranslationWorker(
-            client=client,
+            backend=backend,
             source=source,
-            target=t,
-            system_blocks=system,
-            cache_enabled=cache_enabled,
-            model=DEFAULT_MODEL,
             stop_event=stop_event,
             on_translation=lambda tgt, txt: _push_to_web(
                 "translation", txt, fallback_lang=tgt
@@ -816,13 +571,13 @@ def _build_workers(client: anthropic.Anthropic, source: str, targets: list[str],
 
 
 def run_session(api_key: str, device_index: int, anthropic_api_key: str,
-                source: str, targets: list[str],
-                outline: Optional[str] = None) -> None:
-    config = build_soniox_config(source, api_key)
-    client = anthropic.Anthropic(api_key=anthropic_api_key)
+                source: str, targets: list[str], outline: Optional[str],
+                transcriber_cls, backend_cls, make_client_fn, model: str) -> None:
+    client = make_client_fn(anthropic_api_key)
     stop_event = threading.Event()
 
-    workers = _build_workers(client, source, targets, outline, stop_event)
+    workers = _build_workers(client, source, targets, outline, stop_event,
+                             model, backend_cls)
 
     # Warm each cached worker's ephemeral cache before opening the mic.
     for w in workers:
@@ -832,76 +587,22 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str,
 
     transcription_fallback = PRIMARY_SRC[source]
 
-    print("Connecting to Soniox...")
-    with connect(SONIOX_WEBSOCKET_URL) as ws:
-        ws.send(json.dumps(config))
+    def on_phrase(text: str) -> None:
+        _push_to_web("transcription", text, fallback_lang=transcription_fallback)
+        # Fan-out: enqueue the raw source phrase to every target worker.
+        # Each worker applies its own [SKIP] logic and rolling context.
+        for w in workers:
+            w.enqueue(text)
 
-        audio_thread = threading.Thread(
-            target=stream_audio,
-            args=(device_index, ws, stop_event),
-            daemon=True,
-        )
-        audio_thread.start()
-
-        print("Session started. Speak into your microphone. Press Ctrl+C to stop.")
-
-        final_tokens: list[dict] = []
-        final_translation_tokens: list[dict] = []
-        prev_final_count = 0
-        prev_translation_count = 0
-
-        try:
-            while True:
-                message = ws.recv()
-                res = json.loads(message)
-
-                if res.get("error_code") is not None:
-                    print(f"Error: {res['error_code']} - {res['error_message']}")
-                    break
-
-                for token in res.get("tokens", []):
-                    if token.get("text"):
-                        # Soniox translation tokens are the phrase-boundary gate.
-                        # Their content is discarded (target is zh, a dummy pivot).
-                        if token.get("translation_status") == "translation":
-                            if token.get("is_final"):
-                                final_translation_tokens.append(token)
-                            continue
-                        if token.get("is_final"):
-                            final_tokens.append(token)
-
-                # Flush the buffered transcription when a gating translation
-                # token arrives — that marks the end of the latest phrase.
-                if len(final_translation_tokens) == prev_translation_count:
-                    continue
-
-                new_tokens = final_tokens[prev_final_count:]
-                prev_final_count = len(final_tokens)
-                prev_translation_count = len(final_translation_tokens)
-                text = render_tokens(new_tokens)
-
-                banner = f"[Transcription] {text}"
-                print(banner)
-
-                _push_to_web("transcription", text, fallback_lang=transcription_fallback)
-
-                # Fan-out: enqueue the raw source phrase to every target worker.
-                # Each worker applies its own [SKIP] logic and rolling context.
-                for w in workers:
-                    w.enqueue(text)
-
-                if res.get("finished"):
-                    print("Session finished.")
-
-        except ConnectionClosedOK:
-            pass
-        except KeyboardInterrupt:
-            print("\nInterrupted by user.")
-        except Exception as e:
-            print(f"Error: {e}")
-        finally:
-            stop_event.set()
-            audio_thread.join(timeout=2)
+    transcriber = transcriber_cls(source=source, api_key=api_key)
+    try:
+        transcriber.run(device_index, on_phrase, stop_event)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        stop_event.set()
 
 
 def _parse_and_validate_targets(source: str, target_arg: Optional[str]) -> list[str]:
@@ -958,7 +659,19 @@ def main():
                         help="Path to a UTF-8 .txt sermon outline for context. "
                              "Enables per-target prompt caching when the combined "
                              "system prompt exceeds 1024 tokens.")
+    parser.add_argument("--transcriber", choices=["soniox"], default="soniox",
+                        help="Transcription backend (default: soniox). "
+                             "Loads transcribe_<name>.py at startup.")
+    parser.add_argument("--translator", choices=["claude"], default="claude",
+                        help="Translation backend (default: claude). "
+                             "Loads translate_<name>.py at startup.")
     args = parser.parse_args()
+
+    try:
+        tx_mod = importlib.import_module(f"transcribe_{args.transcriber}")
+        tl_mod = importlib.import_module(f"translate_{args.translator}")
+    except ModuleNotFoundError as e:
+        sys.exit(f"Backend module not found: {e.name}")
 
     targets = _parse_and_validate_targets(args.source, args.target)
 
@@ -999,7 +712,9 @@ def main():
     try:
         print(f"Translation mode: {args.source} → {', '.join(targets)}")
         run_session(api_key, device_index, anthropic_api_key,
-                    source=args.source, targets=targets, outline=outline_text)
+                    source=args.source, targets=targets, outline=outline_text,
+                    transcriber_cls=tx_mod.Transcriber, backend_cls=tl_mod.Backend,
+                    make_client_fn=tl_mod.make_client, model=tl_mod.DEFAULT_MODEL)
     finally:
         if tunnel_proc:
             tunnel_proc.terminate()
