@@ -1,5 +1,6 @@
 # Credentials & secrets
 .env
+live-api-keys.txt
 
 # JSON credentials
 *.json
