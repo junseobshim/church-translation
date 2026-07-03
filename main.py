@@ -306,6 +306,31 @@ CAPTION_HTML = r"""<!DOCTYPE html>
     color: rgba(255,255,255,0.7);
     border-color: rgba(255,255,255,0.35);
   }
+
+  .back-to-live {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(12px);
+    z-index: 500;
+    background: rgba(20,20,20,0.85);
+    color: rgba(255,255,255,0.92);
+    font-family: system-ui, sans-serif;
+    font-size: 14px;
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 20px;
+    padding: 8px 18px;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }
+
+  .back-to-live.visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+  }
 </style>
 </head><body>
 
@@ -318,6 +343,7 @@ CAPTION_HTML = r"""<!DOCTYPE html>
 <div id="container">
   <div id="lines"></div>
 </div>
+<button id="back-to-live" class="back-to-live">&#8595; Back to Live</button>
 
 <script>
 (function() {
@@ -386,6 +412,7 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   const container = document.getElementById('container');
   const linesDiv  = document.getElementById('lines');
   const overlay   = document.getElementById('waiting-overlay');
+  const backToLiveBtn = document.getElementById('back-to-live');
 
   // Apply styles
   document.body.style.background = bgColor;
@@ -414,11 +441,54 @@ CAPTION_HTML = r"""<!DOCTYPE html>
 
   const DOM_CAP = 200;
 
+  // How far back a paused viewer can scroll before old lines age out.
+  // Only enforced while pinned to the live edge — see trimDom().
+  const HISTORY_MS = Math.max(1, parseInt(params.get('historyMinutes') || '3', 10)) * 60 * 1000;
+
   const FAST_MS = 150;
   const MAX_MS  = 1000;
   const GROWTH  = 1.5;
 
   let pollDelay = FAST_MS;
+
+  // Scroll state: whether the viewer is pinned to the live edge (auto-scrolling
+  // on new lines) or has been manually scrolled back to read history.
+  //
+  // Unpinning is driven by actual input gestures (wheel/touch), not by
+  // inspecting scroll position after the fact — during continuous caption
+  // updates the program scrolls to the bottom every ~150ms, so a purely
+  // scroll-position-based check can never find a large enough window to
+  // reliably tell "user scrolled away" from "program is still animating."
+  let pinnedToBottom = true;
+
+  function unpin() {
+    if (!pinnedToBottom) return;
+    pinnedToBottom = false;
+    backToLiveBtn.classList.add('visible');
+  }
+
+  container.addEventListener('wheel', unpin, { passive: true });
+  container.addEventListener('touchmove', unpin, { passive: true });
+
+  // Re-pin if the user scrolls (or is scrolled) back down to the live edge
+  // themselves, without needing to hit the button.
+  container.addEventListener('scroll', function() {
+    if (pinnedToBottom) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (distanceFromBottom < 24) {
+      pinnedToBottom = true;
+      backToLiveBtn.classList.remove('visible');
+    }
+  });
+
+  backToLiveBtn.addEventListener('click', function() {
+    pinnedToBottom = true;
+    backToLiveBtn.classList.remove('visible');
+    // Instant, not smooth: during continuous caption updates the smooth
+    // scroll-behavior on #container would otherwise keep chasing a moving
+    // target (scrollHeight grows every ~150ms) and never visibly settle.
+    container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
+  });
 
   // Multi-language grouping state
   // Groups buffer lines until all expected langs arrive or a timeout fires,
@@ -465,6 +535,7 @@ CAPTION_HTML = r"""<!DOCTYPE html>
     if (!group) {
       const wrapper = document.createElement('div');
       wrapper.className = 'multi-line-block';
+      wrapper.dataset.ts = String(now);
       linesDiv.appendChild(wrapper);
       group = { ts: now, el: wrapper, buffer: {}, flushed: false, timer: null };
       recentGroups.push(group);
@@ -516,14 +587,17 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   }
 
   function appendSingleLine(text) {
+    const ts = String(Date.now());
     if (display === 'paragraph') {
       const span = document.createElement('span');
       span.className = 'span-item';
+      span.dataset.ts = ts;
       span.textContent = text + ' ';
       linesDiv.appendChild(span);
     } else {
       const div = document.createElement('div');
       div.className = 'line-item';
+      div.dataset.ts = ts;
       div.textContent = text;
       linesDiv.appendChild(div);
     }
@@ -534,13 +608,36 @@ CAPTION_HTML = r"""<!DOCTYPE html>
       ? '.multi-line-block'
       : (display === 'paragraph' ? '.span-item' : '.line-item');
 
-    const items = linesDiv.querySelectorAll(selector);
+    // Absolute ceiling regardless of scroll position — a pure memory safety
+    // valve for a viewer left scrolled away for a very long time. Set well
+    // above the normal soft cap so it never disrupts an ordinary
+    // scroll-back-through-history session.
+    const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
+    let items = linesDiv.querySelectorAll(selector);
+    let hardExcess = items.length - HARD_CAP;
+    for (let i = 0; i < hardExcess; i++) {
+      items[i].remove();
+    }
 
+    // Everything below only runs while pinned to the live edge, so we never
+    // yank content out from under someone who has scrolled back to read it.
+    if (!pinnedToBottom) return;
+
+    items = linesDiv.querySelectorAll(selector);
     const limit = maxLines > 0 ? maxLines : DOM_CAP;
     const toRemove = items.length - limit;
-
     for (let i = 0; i < toRemove; i++) {
       items[i].remove();
+    }
+
+    const cutoff = Date.now() - HISTORY_MS;
+    const remaining = linesDiv.querySelectorAll(selector);
+    for (const el of remaining) {
+      if (parseInt(el.dataset.ts, 10) < cutoff) {
+        el.remove();
+      } else {
+        break; // elements are appended in chronological order
+      }
     }
   }
 
@@ -589,7 +686,7 @@ CAPTION_HTML = r"""<!DOCTYPE html>
 
       trimDom();
 
-      if (appended) {
+      if (appended && pinnedToBottom) {
         scrollToBottom();
       }
 
