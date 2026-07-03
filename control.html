@@ -980,8 +980,10 @@
         chip.classList.add('active');
         chip.querySelector('input').checked = true;
       });
+      document.getElementById('targetCard').style.opacity = '0.5';
       document.getElementById('targetCard').style.pointerEvents = 'none';
     } else {
+      document.getElementById('targetCard').style.opacity = '1';
       document.getElementById('targetCard').style.pointerEvents = 'auto';
       // Remove source lang from targets if present
       if (targets.has(source)) {
