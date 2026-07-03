@@ -1138,17 +1138,6 @@
     const remoteBase = 'https://live.rctranslation.org';
     const links = [];
 
-    // Multi-language combined view (only when 2+ targets)
-    if (targets.size >= 2) {
-      const langsStr = [...targets].join(',');
-      links.push({
-        icon: '🌐',
-        name: 'All languages · Combined',
-        url: `${localBase}/?mode=translation&langs=${langsStr}&fontSize=48&bgColor=%23000&padding=40`,
-        sub: 'Side-by-side view',
-      });
-    }
-
     [...targets].forEach(lang => {
       const langName = {en:'English', ko:'Korean', es:'Spanish'}[lang];
       const flags = {en:'🇺🇸', ko:'🇰🇷', es:'🇪🇸'};
