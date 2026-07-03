@@ -63,7 +63,7 @@ source venv/bin/activate
 if lsof -i :"$CONTROL_PORT" >/dev/null 2>&1; then
     echo "[Launcher] Control server already running."
 else
-    python3 control_server.py \
+    venv/bin/python3 control_server.py \
         > /tmp/rc_translation.log 2>&1 &
 
     SERVER_PID=$!

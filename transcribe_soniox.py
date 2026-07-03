@@ -120,74 +120,103 @@ class Transcriber:
     def run(self, device_index: int, on_phrase: Callable[[str], None],
             stop_event: threading.Event) -> None:
         config = build_soniox_config(self.source, self.api_key)
-        print("Connecting to Soniox...")
-        with connect(SONIOX_WEBSOCKET_URL) as ws:
-            ws.send(json.dumps(config))
 
-            def audio_pump():
-                try:
-                    for chunk in iter_audio_chunks(device_index, SAMPLE_RATE,
-                                                   CHUNK_FRAMES, stop_event):
-                        ws.send(chunk)
-                except Exception:
-                    pass
-                # Empty string signals end-of-audio to the server.
-                try:
-                    ws.send("")
-                except Exception:
-                    pass
+        # Accumulated token state — preserved across reconnects so transcription
+        # context is not lost if the WebSocket drops and reconnects.
+        final_tokens: list[dict] = []
+        final_translation_tokens: list[dict] = []
+        prev_final_count = 0
+        prev_translation_count = 0
 
-            audio_thread = threading.Thread(target=audio_pump, daemon=True)
-            audio_thread.start()
+        RECONNECT_DELAY = 2   # seconds to wait before reconnecting
+        MAX_RECONNECTS = 10   # give up after this many consecutive failures
 
-            print("Session started. Speak into your microphone. Press Ctrl+C to stop.")
+        consecutive_failures = 0
 
-            final_tokens: list[dict] = []
-            final_translation_tokens: list[dict] = []
-            prev_final_count = 0
-            prev_translation_count = 0
-
+        while not stop_event.is_set():
             try:
-                while True:
-                    message = ws.recv()
-                    res = json.loads(message)
+                print(f"Connecting to Soniox{'(reconnecting)' if consecutive_failures else ''}...")
+                with connect(SONIOX_WEBSOCKET_URL) as ws:
+                    ws.send(json.dumps(config))
+                    consecutive_failures = 0  # reset on successful connect
 
-                    if res.get("error_code") is not None:
-                        print(f"Error: {res['error_code']} - {res['error_message']}")
-                        break
+                    def audio_pump():
+                        try:
+                            for chunk in iter_audio_chunks(device_index, SAMPLE_RATE,
+                                                           CHUNK_FRAMES, stop_event):
+                                ws.send(chunk)
+                        except Exception:
+                            pass
+                        try:
+                            ws.send("")
+                        except Exception:
+                            pass
 
-                    for token in res.get("tokens", []):
-                        if token.get("text"):
-                            # Soniox translation tokens are the phrase-boundary gate.
-                            # Their content is discarded (target is zh, a dummy pivot).
-                            if token.get("translation_status") == "translation":
-                                if token.get("is_final"):
-                                    final_translation_tokens.append(token)
+                    audio_thread = threading.Thread(target=audio_pump, daemon=True)
+                    audio_thread.start()
+
+                    print("Session started. Speak into your microphone. Press Ctrl+C to stop.")
+
+                    try:
+                        while True:
+                            message = ws.recv()
+                            res = json.loads(message)
+
+                            if res.get("error_code") is not None:
+                                print(f"Error: {res['error_code']} - {res['error_message']}")
+                                break
+
+                            for token in res.get("tokens", []):
+                                if token.get("text"):
+                                    if token.get("translation_status") == "translation":
+                                        if token.get("is_final"):
+                                            final_translation_tokens.append(token)
+                                        continue
+                                    if token.get("is_final"):
+                                        final_tokens.append(token)
+
+                            if len(final_translation_tokens) == prev_translation_count:
                                 continue
-                            if token.get("is_final"):
-                                final_tokens.append(token)
 
-                    # Flush the buffered transcription when a gating translation
-                    # token arrives — that marks the end of the latest phrase.
-                    if len(final_translation_tokens) == prev_translation_count:
-                        continue
+                            new_tokens = final_tokens[prev_final_count:]
+                            prev_final_count = len(final_tokens)
+                            prev_translation_count = len(final_translation_tokens)
+                            text = render_tokens(new_tokens)
 
-                    new_tokens = final_tokens[prev_final_count:]
-                    prev_final_count = len(final_tokens)
-                    prev_translation_count = len(final_translation_tokens)
-                    text = render_tokens(new_tokens)
+                            print(f"[Transcription] {text}")
+                            on_phrase(text)
 
-                    print(f"[Transcription] {text}")
-                    on_phrase(text)
+                            if res.get("finished"):
+                                print("Session finished.")
+                                stop_event.set()
+                                break
 
-                    if res.get("finished"):
-                        print("Session finished.")
-            except ConnectionClosedOK:
-                pass
+                    except ConnectionClosedOK:
+                        if stop_event.is_set():
+                            break
+                        print("[Soniox] Connection closed — reconnecting…")
+                    except KeyboardInterrupt:
+                        print("\nInterrupted by user.")
+                        stop_event.set()
+                        break
+                    except Exception as e:
+                        if stop_event.is_set():
+                            break
+                        print(f"[Soniox] Session error: {e} — reconnecting…")
+                    finally:
+                        audio_thread.join(timeout=2)
+
             except KeyboardInterrupt:
-                print("\nInterrupted by user.")
-            except Exception as e:
-                print(f"Error: {e}")
-            finally:
                 stop_event.set()
-                audio_thread.join(timeout=2)
+                break
+            except Exception as e:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_RECONNECTS:
+                    print(f"[Soniox] Failed to connect after {MAX_RECONNECTS} attempts: {e}")
+                    stop_event.set()
+                    break
+                print(f"[Soniox] Connection error ({consecutive_failures}/{MAX_RECONNECTS}): {e}")
+
+            if not stop_event.is_set():
+                print(f"[Soniox] Waiting {RECONNECT_DELAY}s before reconnect…")
+                stop_event.wait(RECONNECT_DELAY)

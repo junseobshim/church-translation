@@ -191,6 +191,56 @@
     background: var(--green);
   }
 
+  /* Device selector */
+  .device-select {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%237a8494' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    padding-right: 40px;
+  }
+
+  .device-select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .device-refresh {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 16px;
+    transition: all 0.15s;
+    margin-left: 10px;
+  }
+
+  .device-refresh:hover {
+    border-color: var(--border-active);
+    color: var(--text);
+  }
+
+  .device-row {
+    display: flex;
+    align-items: center;
+  }
+
+  .device-row .device-select {
+    flex: 1;
+  }
+
   /* Outline input */
   .outline-input {
     width: 100%;
@@ -631,6 +681,20 @@
   <!-- Error banner -->
   <div class="error-banner" id="errorBanner"></div>
 
+  <!-- Audio device -->
+  <div class="card">
+    <div class="card-label">Audio input</div>
+    <div class="device-row">
+      <select class="device-select" id="deviceSelect">
+        <option value="">Loading devices…</option>
+      </select>
+      <button class="device-refresh" onclick="loadDevices()" title="Refresh devices">↺</button>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--muted)">
+      Select the microphone or audio input device to use.
+    </div>
+  </div>
+
   <!-- Source language -->
   <div class="card">
     <div class="card-label">Speaker's language</div>
@@ -865,6 +929,7 @@
   // ── State ──────────────────────────────────────────────────────────────────
   let source = 'ko';
   let targets = new Set(['en']);
+  let deviceIndex = null;
   let running = false;
   let sessionProc = null;
   let startTime = null;
@@ -873,6 +938,34 @@
   let lastLineCount = 0;
   let advancedOpen = false;
   let outlineTempPath = null;
+
+  // ── Device loading ─────────────────────────────────────────────────────────
+  async function loadDevices() {
+    const sel = document.getElementById('deviceSelect');
+    sel.innerHTML = '<option value="">Loading…</option>';
+    try {
+      const r = await fetch('/api/devices');
+      if (!r.ok) throw new Error();
+      const devices = await r.json();
+      sel.innerHTML = '';
+      devices.forEach((d, i) => {
+        const opt = document.createElement('option');
+        opt.value = d.index;
+        opt.textContent = d.name;
+        if (i === 0) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      deviceIndex = sel.value || null;
+      updateCmd();
+    } catch(e) {
+      sel.innerHTML = '<option value="">⚠ Could not load devices — is the server running?</option>';
+    }
+  }
+
+  document.getElementById('deviceSelect').addEventListener('change', function() {
+    deviceIndex = this.value || null;
+    updateCmd();
+  });
 
   // ── Source selection ───────────────────────────────────────────────────────
   function selectSource(btn) {
@@ -951,6 +1044,7 @@
     let cmd = `<span class="cmd-part">python</span> <span class="cmd-arg">main.py</span>`;
     cmd += ` --source ${source}`;
     if (targetStr) cmd += ` --target ${targetStr}`;
+    if (deviceIndex) cmd += ` --device ${deviceIndex}`;
     cmd += ` --port ${port}`;
     if (!tunnel) cmd += ` --no-tunnel`;
     if (document.getElementById('outlineText').value.trim()) cmd += ` --outline &lt;outline.txt&gt;`;
@@ -1097,6 +1191,7 @@
       stopTimer();
       stopPoll();
       running = false;
+      releaseWakeLock();
       document.getElementById('mainBtn').className = 'btn-main start';
       document.getElementById('mainBtn').textContent = 'Start Translation';
       document.getElementById('previewCard').style.display = 'none';
@@ -1114,7 +1209,7 @@
     const payload = {
       source,
       targets: [...targets],
-      device: null,
+      device: parseInt(deviceIndex),
       port: parseInt(document.getElementById('portInput').value) || 8080,
       tunnel: document.getElementById('tunnelToggle').checked,
       outline: outline || null,
@@ -1133,6 +1228,7 @@
       if (!r.ok || res.error) throw new Error(res.error || 'Failed to start');
 
       running = true;
+      requestWakeLock();
       document.getElementById('mainBtn').disabled = false;
       document.getElementById('mainBtn').className = 'btn-main stop';
       document.getElementById('mainBtn').textContent = 'Stop Translation';
@@ -1181,12 +1277,45 @@
 
   // ── Heartbeat — tell server this tab is alive ──────────────────────────────
   function sendHeartbeat() {
-    fetch('/api/heartbeat', { cache: 'no-store' }).catch(() => {});
+    fetch('/api/heartbeat', { cache: 'no-store', keepalive: true }).catch(() => {});
   }
   sendHeartbeat();
   setInterval(sendHeartbeat, 4000);
 
+  // Keep heartbeat alive even when tab is backgrounded or display sleeps.
+  // visibilitychange fires when Chrome suspends/resumes the tab — send an
+  // immediate beat on resume so the server never sees a false timeout.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      sendHeartbeat();
+    }
+  });
+
+  // Also use the Page Visibility + wakeLock API if available to discourage
+  // Chrome from throttling the tab's timers during a live session.
+  let _wakeLock = null;
+  async function requestWakeLock() {
+    if ('wakeLock' in navigator) {
+      try {
+        _wakeLock = await navigator.wakeLock.request('screen');
+      } catch (e) { /* permission denied or not supported */ }
+    }
+  }
+  async function releaseWakeLock() {
+    if (_wakeLock) {
+      try { await _wakeLock.release(); } catch (e) {}
+      _wakeLock = null;
+    }
+  }
+  // Re-acquire wake lock when tab becomes visible again (it's released automatically on hide)
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && running) {
+      await requestWakeLock();
+    }
+  });
+
   // ── Init ───────────────────────────────────────────────────────────────────
+  loadDevices();
   updateCmd();
   setStatus('ready', 'Ready · select settings below');
 </script>
