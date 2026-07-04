@@ -9,6 +9,8 @@ Real-time sermon translation using [Soniox](https://soniox.com/) real-time STT a
 - An [Anthropic API key](https://console.anthropic.com/) (Claude translation)
 - An audio input device (e.g. USB interface from church soundboard)
 
+
+
 ## Setup
 
 ```bash
@@ -26,6 +28,8 @@ pip install -r requirements.txt
 # Configure API keys
 cp .env.example .env   # then edit .env and fill in SONIOX_API_KEY and ANTHROPIC_API_KEY
 ```
+
+
 
 ## Running
 
@@ -58,22 +62,24 @@ If you have the sermon outline ahead of time, pass it with `--outline` to give C
 python main.py --outline path/to/sermon.txt
 ```
 
-- The file must be UTF-8 plain text. Any `.txt` with bullet points, verse references, or prose works. For a multilingual sermon, use a single multilingual outline; it is attached verbatim to every target worker's system prompt.
+- The file must be UTF-8 plain text, or a Word .docx file (which will be converted to plain text). Any `.txt` with bullet points, verse references, or prose works. For a multilingual sermon, use a single multilingual outline; it is attached verbatim to every target worker's system prompt.
 - Caching activates only when the combined system prompt + outline exceeds 1024 tokens (roughly 700–800 words). Below that, the script warns on stderr and runs without caching.
 - With multiple `--target` languages, each target worker caches its own system-prompt + outline independently and has its own keep-alive ping. Expect one `Cache warmed` message per cached worker at startup.
 - The cache has a 5-minute lifetime between calls. A keep-alive ping fires every 4m30s of silence so the cache survives long pauses.
 - The outline is used as **context only** — Claude is instructed to translate what is actually said, even when the speaker rhetorically diverges from the outline.
 
+
+
 ### Application
 
 The recommended way to run this is via the included Automator app (`launcher.sh`), which:
 
-1. Launches LadioCast for audio routing
-2. Starts `control_server.py` (the volunteer control panel) in the background
-3. Opens `http://localhost:9090` in Chrome
-4. Exits cleanly when the browser tab is closed or the volunteer clicks **Stop & Close Server**
+1. Starts `control_server.py` (the volunteer control panel) in the background
+2. Opens `http://localhost:9090` in Chrome
+3. Exits cleanly when the browser tab is closed or the volunteer clicks **Stop & Close Server**
 
 To set it up:
+
 1. Open Automator → New Document → **Application**
 2. Add a **Run Shell Script** action (Shell: `/bin/bash`, Pass input: as arguments)
 3. Paste the contents of `launcher.sh`
@@ -85,37 +91,45 @@ From the control panel at `http://localhost:9090`, volunteers can select the aud
 
 Open in any browser or ProPresenter Web Fill:
 
-| URL | What it shows |
-|-----|---------------|
-| `http://localhost:8080/` | All transcription lines, regardless of detected language (Korean, English, Spanish as spoken). No query params needed. |
-| `http://localhost:8080/?mode=translation` | Translations in the default target (the first `--target`). |
-| `http://localhost:8080/?mode=translation&lang=en` | English translations only |
-| `http://localhost:8080/?mode=translation&lang=ko` | Korean translations only |
-| `http://localhost:8080/?mode=translation&lang=es` | Spanish translations only |
-| `http://localhost:8080/?display=paragraph` | Paragraph style (for ProPresenter) |
-| `http://localhost:8080/?mode=translation&lang=en&display=paragraph` | English translations, paragraph style |
+
+| URL                                                                                                                                             | What it shows                                                                                                                |
+| ----------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `http://localhost:8080/`                                                                                                                        | All transcription lines, regardless of detected language (Korean, English, Spanish as spoken). No query params needed.       |
+| `http://localhost:8080/?mode=translation`                                                                                                       | Translations in the default target (the first `--target`).                                                                   |
+| `http://localhost:8080/?mode=translation&lang=en`                                                                                               | English translations only                                                                                                    |
+| `http://localhost:8080/?mode=translation&lang=ko`                                                                                               | Korean translations only                                                                                                     |
+| `http://localhost:8080/?mode=translation&lang=es`                                                                                               | Spanish translations only                                                                                                    |
+| `http://localhost:8080/?display=paragraph`                                                                                                      | Paragraph style (for ProPresenter)                                                                                           |
+| `http://localhost:8080/?mode=translation&lang=en&display=paragraph`                                                                             | English translations, paragraph style                                                                                        |
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=96&fontWeight=500&lineSpacing=1.3&bgColor=transparent&hideStatus=1` | English translations default for RCC Sanctuary TV display (ProPresenter web fill — transparent overlay, no status indicator) |
-| `http://localhost:8080/?mode=transcription&lang=ko` | Only Korean transcription segments (explicit filter on the transcription stream) |
+| `http://localhost:8080/?mode=transcription&lang=ko`                                                                                             | Only Korean transcription segments (explicit filter on the transcription stream)                                             |
+
+
+
 
 ### Query Parameters
 
-| Param | Default | Description |
-|-------|---------|-------------|
-| `mode` | `transcription` | `transcription` or `translation` |
-| `lang` | first `--target` for translation mode; no filter for transcription mode | ISO 639-1 language filter. In transcription mode, omitting `lang` shows all languages as spoken; in translation mode it defaults to the first `--target`. Explicit value always wins. |
-| `display` | `line` | `line` (block divs) or `paragraph` (inline spans) |
-| `fontSize` | `48` | Font size in px |
-| `fontFamily` | `system-ui, sans-serif` | CSS font stack |
-| `googleFont` | — | Google Fonts name (auto-loaded) |
-| `fontWeight` | `normal` | CSS font weight |
-| `color` | `white` | Text color |
-| `lineSpacing` | `1.4` | CSS line-height |
-| `textAlign` | `left` | CSS text-align |
-| `textShadow` | `none` | CSS text-shadow |
-| `bgColor` | `#000` | Background color. Pass `bgColor=transparent` for ProPresenter web fill. |
-| `hideStatus` | `0` | Set to `1` to suppress the bottom-right "Waiting for transcription…" connection indicator. Use for ProPresenter web fill so the indicator never paints on the projection. |
-| `padding` | `20` | Container padding in px |
-| `maxLines` | `0` (unlimited) | Max lines displayed (hard cap 200) |
+
+| Param         | Default                                                                 | Description                                                                                                                                                                           |
+| ------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`        | `transcription`                                                         | `transcription` or `translation`                                                                                                                                                      |
+| `lang`        | first `--target` for translation mode; no filter for transcription mode | ISO 639-1 language filter. In transcription mode, omitting `lang` shows all languages as spoken; in translation mode it defaults to the first `--target`. Explicit value always wins. |
+| `display`     | `line`                                                                  | `line` (block divs) or `paragraph` (inline spans)                                                                                                                                     |
+| `fontSize`    | `48`                                                                    | Font size in px                                                                                                                                                                       |
+| `fontFamily`  | `system-ui, sans-serif`                                                 | CSS font stack                                                                                                                                                                        |
+| `googleFont`  | —                                                                       | Google Fonts name (auto-loaded)                                                                                                                                                       |
+| `fontWeight`  | `normal`                                                                | CSS font weight                                                                                                                                                                       |
+| `color`       | `white`                                                                 | Text color                                                                                                                                                                            |
+| `lineSpacing` | `1.4`                                                                   | CSS line-height                                                                                                                                                                       |
+| `textAlign`   | `left`                                                                  | CSS text-align                                                                                                                                                                        |
+| `textShadow`  | `none`                                                                  | CSS text-shadow                                                                                                                                                                       |
+| `bgColor`     | `#000`                                                                  | Background color. Pass `bgColor=transparent` for ProPresenter web fill.                                                                                                               |
+| `hideStatus`  | `0`                                                                     | Set to `1` to suppress the bottom-right "Waiting for transcription…" connection indicator. Use for ProPresenter web fill so the indicator never paints on the projection.             |
+| `padding`     | `20`                                                                    | Container padding in px                                                                                                                                                               |
+| `maxLines`    | `0` (unlimited)                                                         | Max lines displayed (hard cap 200)                                                                                                                                                    |
+
+
+
 
 ## Cloudflare Tunnel (Internet Access)
 
@@ -139,39 +153,46 @@ python main.py --no-tunnel  # localhost only
 ```
 
 Viewers can access:
+
 - `https://live.rctranslation.org/` — all transcription lines, regardless of language, with a solid black background (default)
 - `https://live.rctranslation.org/?mode=translation&lang=en` — English translations
 - `https://live.rctranslation.org/?mode=translation&lang=ko` — Korean translations
 - `https://live.rctranslation.org/?mode=translation&lang=es` — Spanish translations
 
+
+
 ### Waiting page
 
-When the tunnel has no origin (i.e. no device is running `main.py`), visitors to `live.rctranslation.org` see Cloudflare's default 530 error. To replace that with a branded "Waiting for transcription…" page that auto-refreshes into captions when the tunnel comes back online, deploy the Cloudflare Worker in `worker/`. See [`worker/README.md`](worker/README.md) for the one-time deploy.
+When the tunnel has no origin (i.e. no device is running `main.py`), visitors to `live.rctranslation.org` see Cloudflare's default 530 error. To replace that with a branded "Waiting for transcription…" page that auto-refreshes into captions when the tunnel comes back online, deploy the Cloudflare Worker in `worker/`. See `[worker/README.md](worker/README.md)` for the one-time deploy.
 
 ## CLI Options
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--source {ko,en,es,multi}` | `ko` | Source language. `ko` = Korean + English, `en` = English only, `es` = Spanish + English, `multi` = Korean + English + Spanish. Sets Soniox's strict language hints. |
-| `--target CSV` | `en` when `--source ko`, `ko,en,es` when `--source multi`; required otherwise | Comma-separated translation targets. Must be a non-empty subset of `{ko,en,es}` excluding `--source`. For `--source multi`, must be exactly `ko,en,es`. Each target runs as its own parallel Claude worker. |
-| `--device N` | (interactive) | Audio input device index (skip selection prompt) |
-| `--port PORT` | `8080` | Web caption server port (`0` to disable) |
-| `--tunnel NAME` | `church-live` | Cloudflare tunnel name to start |
-| `--no-tunnel` | — | Skip starting the Cloudflare tunnel |
-| `--outline PATH` | — | Path to a UTF-8 `.txt` sermon outline. Enables per-target prompt caching when the combined system prompt exceeds 1024 tokens. |
-| `--transcriber {soniox}` | `soniox` | Transcription backend. Loads `transcribe_<name>.py` at startup. More options will be added as alternative backends land (e.g. `mlx-whisper`, `azure`). |
-| `--translator {claude}` | `claude` | Translation backend. Loads `translate_<name>.py` at startup. More options will be added as alternative backends land (e.g. `qwen-mlx`, `gemini`). |
+
+| Flag                        | Default                                                                       | Description                                                                                                                                                                                                 |
+| --------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--source {ko,en,es,multi}` | `ko`                                                                          | Source language. `ko` = Korean + English, `en` = English only, `es` = Spanish + English, `multi` = Korean + English + Spanish. Sets Soniox's strict language hints.                                         |
+| `--target CSV`              | `en` when `--source ko`, `ko,en,es` when `--source multi`; required otherwise | Comma-separated translation targets. Must be a non-empty subset of `{ko,en,es}` excluding `--source`. For `--source multi`, must be exactly `ko,en,es`. Each target runs as its own parallel Claude worker. |
+| `--device N`                | (interactive)                                                                 | Audio input device index (skip selection prompt)                                                                                                                                                            |
+| `--port PORT`               | `8080`                                                                        | Web caption server port (`0` to disable)                                                                                                                                                                    |
+| `--tunnel NAME`             | `church-live`                                                                 | Cloudflare tunnel name to start                                                                                                                                                                             |
+| `--no-tunnel`               | —                                                                             | Skip starting the Cloudflare tunnel                                                                                                                                                                         |
+| `--outline PATH`            | —                                                                             | Path to a UTF-8 `.txt` sermon outline. Enables per-target prompt caching when the combined system prompt exceeds 1024 tokens.                                                                               |
+| `--transcriber {soniox}`    | `soniox`                                                                      | Transcription backend. Loads `transcribe_<name>.py` at startup. More options will be added as alternative backends land (e.g. `mlx-whisper`, `azure`).                                                      |
+| `--translator {claude}`     | `claude`                                                                      | Translation backend. Loads `translate_<name>.py` at startup. More options will be added as alternative backends land (e.g. `qwen-mlx`, `gemini`).                                                           |
+
+
+
 
 ## Architecture
 
 The codebase splits into a shared shell plus per-backend modules:
 
-- **`main.py`** — shared infrastructure: audio capture, web caption server, Cloudflare tunnel, prompt-building scaffolding, the LLM-agnostic `TranslationWorker` (queue/`[SKIP]`/rolling context), orchestration, and CLI. It loads the requested transcription and translation modules lazily via `importlib`, so a deployment using only e.g. `azure` + `gemini` backends would not pull in `websockets` or `anthropic`.
-- **`transcribe_soniox.py`** — Soniox transcription backend: WebSocket session, audio pump, recv/gating loop, term lists, and the `[Transcription]` print. Imports `websockets`.
-- **`translate_claude.py`** — Claude translation backend: per-target system prompt, ephemeral cache eligibility check, cache warmup, keepalive thread, and the `messages.create` translation call. Imports `anthropic`.
-- **`control_server.py`** — Volunteer control panel server (`http://localhost:9090`). Serves `control.html`, manages the `main.py` subprocess, and shuts itself down when the browser tab closes.
-- **`control.html`** — Volunteer UI: device selection, source/target language picker, optional sermon outline upload, start/stop controls, and live caption viewer links.
-- **`launcher.sh`** — Automator shell script: starts LadioCast, launches `control_server.py`, opens Chrome, and waits — exiting cleanly when the server shuts down.
+- `main.py` — shared infrastructure: audio capture, web caption server, Cloudflare tunnel, prompt-building scaffolding, the LLM-agnostic `TranslationWorker` (queue/`[SKIP]`/rolling context), orchestration, and CLI. It loads the requested transcription and translation modules lazily via `importlib`, so a deployment using only e.g. `azure` + `gemini` backends would not pull in `websockets` or `anthropic`.
+- `transcribe_soniox.py` — Soniox transcription backend: WebSocket session, audio pump, recv/gating loop, term lists, and the `[Transcription]` print. Imports `websockets`.
+- `translate_claude.py` — Claude translation backend: per-target system prompt, ephemeral cache eligibility check, cache warmup, keepalive thread, and the `messages.create` translation call. Imports `anthropic`.
+- `control_server.py` — Volunteer control panel server (`http://localhost:9090`). Serves `control.html`, manages the `main.py` subprocess, and shuts itself down when the browser tab closes.
+- `control.html` — Volunteer UI: device selection, source/target language picker, optional sermon outline upload, start/stop controls, and live caption viewer links.
+- `launcher.sh` — Automator shell script: starts LadioCast, launches `control_server.py`, opens Chrome, and waits — exiting cleanly when the server shuts down.
 
 Alternative backends drop in alongside without modifying the main file beyond extending the `--transcriber` / `--translator` choice lists. They must implement these contracts:
 
