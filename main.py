@@ -37,7 +37,7 @@ SOURCE_LANGS = {
     "ko":    ["ko", "en"],
     "en":    ["en"],
     "es":    ["es", "en"],
-    "multi": ["ko", "en", "es"],
+    "multi": ["ko", "en", "es", "zh"],
 }
 
 # Fallback tag when render_tokens emits text with no [xx] language prefix
@@ -55,6 +55,7 @@ FILLER_CLAUSE_BY_LANG = {
     "ko": "Korean hesitation fillers (아, 어)",
     "en": "English hesitation fillers (uh, um, like, you know, so, I mean)",
     "es": "Spanish hesitation fillers (eh, este, pues, o sea, bueno)",
+    "zh": "Chinese hesitation fillers (那个, 嗯, 就是, 这个)",
 }
 
 BIBLE_BY_TARGET = {
@@ -90,7 +91,7 @@ SOURCE_COMPOSITION = {
     "ko":    "Korean (with occasional English)",
     "en":    "English",
     "es":    "Spanish (with occasional English)",
-    "multi": "mixed Korean, English, and Spanish",
+    "multi": "mixed Korean, English, and Spanish (with occasional Chinese)",
 }
 
 OUTLINE_WRAPPER = (
