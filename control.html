@@ -1102,8 +1102,13 @@
         const r = await fetch('/api/latest', { cache: 'no-store' });
         if (!r.ok) return;
         const data = await r.json();
-        const newLines = data.lines.slice(lastLineCount);
-        lastLineCount = data.lines.length;
+        // The caption server keeps only a recent window of lines; track our
+        // position with its absolute start/total indices, not lines.length.
+        const start = data.start || 0;
+        const total = data.total || data.lines.length;
+        if (total < lastLineCount) lastLineCount = start; // server restarted
+        const newLines = data.lines.slice(Math.max(0, lastLineCount - start));
+        lastLineCount = total;
         if (newLines.length === 0) return;
         const box = document.getElementById('previewBox');
         const wasEmpty = box.querySelector('span');

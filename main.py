@@ -11,6 +11,7 @@ import signal
 import subprocess
 import http.server
 import importlib
+from collections import deque
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
@@ -161,21 +162,47 @@ def build_prompt(source: str, target: str) -> str:
 
 # ── Web State ─────────────────────────────────────────────────────────────────
 
-_web_state = {"lines": [], "updated": 0}
+# Viewers poll /api/latest for the whole service, so the payload must stay
+# bounded: keep only a recent window of lines plus a cumulative counter, and
+# let clients track their position via the start/total indices in the response.
+_WEB_LINES_MAX = 300
+
+_web_state = {"lines": deque(maxlen=_WEB_LINES_MAX), "total": 0, "updated": 0}
 _web_lock = threading.Lock()
 _default_target_lang = "en"  # set in main() from the first --target; injected into HTML
 
 
+def _encode_web_state() -> bytes:
+    """Caller must hold _web_lock (except at import time)."""
+    lines = list(_web_state["lines"])
+    return json.dumps({
+        "lines": lines,
+        "start": _web_state["total"] - len(lines),
+        "total": _web_state["total"],
+        "updated": _web_state["updated"],
+    }).encode()
+
+
+# Pre-encoded /api/latest response, rebuilt once per appended line. Viewer
+# polls just grab these bytes instead of re-serializing the state under
+# _web_lock on every request, which would block the transcription/translation
+# threads pushing new lines.
+_web_json_cache = _encode_web_state()
+
+
 def _update_web_state(kind: str, lang: str, text: str):
     """kind='transcription' or 'translation', lang='en'/'ko'/'es'/…"""
+    global _web_json_cache
     with _web_lock:
         _web_state["lines"].append({"kind": kind, "lang": lang, "text": text})
+        _web_state["total"] += 1
         _web_state["updated"] = time.time()
+        _web_json_cache = _encode_web_state()
 
 
 def _get_web_state_json() -> bytes:
     with _web_lock:
-        return json.dumps(_web_state).encode()
+        return _web_json_cache
 
 
 def _push_to_web(kind: str, text: str, fallback_lang: str = "en"):
@@ -211,7 +238,9 @@ CAPTION_HTML = r"""<!DOCTYPE html>
     width: 100%;
     height: 100%;
     overflow-y: auto;
-    scroll-behavior: smooth;
+    /* No scroll-behavior: smooth — trimming old content shrinks scrollHeight
+       mid-animation and yanks the target around; entrance smoothness comes
+       from the fadeIn animation instead. */
     scrollbar-width: none;
     -ms-overflow-style: none;
   }
@@ -248,6 +277,7 @@ CAPTION_HTML = r"""<!DOCTYPE html>
 
   .span-item {
     /* paragraph mode */
+    animation: fadeIn 0.25s ease-out;
   }
 
   @keyframes fadeIn {
@@ -443,11 +473,19 @@ CAPTION_HTML = r"""<!DOCTYPE html>
 
   const DOM_CAP = 200;
 
+  // Paragraph mode groups spans into chunk <div>s of this many phrases. Each
+  // chunk wraps its text independently, so trimming whole old chunks never
+  // re-wraps ("respaces") the text still on screen — removing spans from the
+  // front of one flowing block would shift every wrap point after it.
+  const CHUNK_SPANS = 20;
+
   // How far back a paused viewer can scroll before old lines age out.
   // Only enforced while pinned to the live edge — see trimDom().
   const HISTORY_MS = Math.max(1, parseInt(params.get('historyMinutes') || '3', 10)) * 60 * 1000;
 
-  const FAST_MS = 150;
+  // Phrases arrive every few seconds, so 300ms polling still feels instant;
+  // faster only multiplies load by every phone in the congregation.
+  const FAST_MS = 300;
   const MAX_MS  = 1000;
   const GROWTH  = 1.5;
 
@@ -458,9 +496,9 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   //
   // Unpinning is driven by actual input gestures (wheel/touch), not by
   // inspecting scroll position after the fact — during continuous caption
-  // updates the program scrolls to the bottom every ~150ms, so a purely
+  // updates the program scrolls to the bottom on every new line, so a purely
   // scroll-position-based check can never find a large enough window to
-  // reliably tell "user scrolled away" from "program is still animating."
+  // reliably tell "user scrolled away" from "program just scrolled."
   let pinnedToBottom = true;
 
   function unpin() {
@@ -486,9 +524,6 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   backToLiveBtn.addEventListener('click', function() {
     pinnedToBottom = true;
     backToLiveBtn.classList.remove('visible');
-    // Instant, not smooth: during continuous caption updates the smooth
-    // scroll-behavior on #container would otherwise keep chasing a moving
-    // target (scrollHeight grows every ~150ms) and never visibly settle.
     container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
   });
 
@@ -595,7 +630,16 @@ CAPTION_HTML = r"""<!DOCTYPE html>
       span.className = 'span-item';
       span.dataset.ts = ts;
       span.textContent = text + ' ';
-      linesDiv.appendChild(span);
+      let chunk = linesDiv.lastElementChild;
+      if (!chunk || chunk.childElementCount >= CHUNK_SPANS) {
+        chunk = document.createElement('div');
+        chunk.className = 'para-chunk';
+        linesDiv.appendChild(chunk);
+      }
+      chunk.appendChild(span);
+      // Newest span's timestamp: the whole chunk ages out only once this
+      // is past the history cutoff (see trimParagraphChunks).
+      chunk.dataset.ts = ts;
     } else {
       const div = document.createElement('div');
       div.className = 'line-item';
@@ -605,10 +649,72 @@ CAPTION_HTML = r"""<!DOCTYPE html>
     }
   }
 
+  // Remove elements while keeping the viewport visually anchored: deleting
+  // content above the fold shifts everything up by its height, so shift a
+  // scrolled-back reader's scrollTop up by the same amount. While pinned the
+  // browser's own scrollTop clamping keeps the view glued to the live edge.
+  function removeWithScrollAnchor(els) {
+    if (els.length === 0) return;
+    if (pinnedToBottom) {
+      for (const el of els) el.remove();
+      return;
+    }
+    const before = container.scrollHeight;
+    for (const el of els) el.remove();
+    const delta = before - container.scrollHeight;
+    if (delta > 0) {
+      container.scrollTo({ top: Math.max(0, container.scrollTop - delta), behavior: 'instant' });
+    }
+  }
+
+  // Paragraph mode trims whole chunks only — dropping an entire chunk leaves
+  // the line-wrapping of every remaining chunk untouched, so text the viewer
+  // already read never re-wraps (see CHUNK_SPANS).
+  function trimParagraphChunks() {
+    const chunks = Array.from(linesDiv.children);
+    if (chunks.length <= 1) return; // never trim the chunk still being written
+    const sizes = chunks.map(c => c.childElementCount);
+    let total = sizes.reduce((a, b) => a + b, 0);
+
+    const toRemove = [];
+    let idx = 0;
+    const dropOldestWhile = cond => {
+      while (idx < chunks.length - 1 && cond(idx)) {
+        total -= sizes[idx];
+        toRemove.push(chunks[idx]);
+        idx++;
+      }
+    };
+
+    // Absolute ceiling regardless of scroll position — a pure memory safety
+    // valve for a viewer left scrolled away for a very long time.
+    const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
+    dropOldestWhile(() => total > HARD_CAP);
+
+    // Everything below only runs while pinned to the live edge, so we never
+    // yank content out from under someone who has scrolled back to read it.
+    if (pinnedToBottom) {
+      // Trim in batches: start only once well past the cap, then cut back to
+      // it, so trims happen once every several minutes instead of per poll.
+      const limit = maxLines > 0 ? maxLines : DOM_CAP;
+      if (total > limit * 1.5) dropOldestWhile(() => total > limit);
+
+      // Age-out on chunk boundaries: a chunk leaves only once its newest
+      // span is past the cutoff, so at least HISTORY_MS of history remains.
+      const cutoff = Date.now() - HISTORY_MS;
+      dropOldestWhile(i => parseInt(chunks[i].dataset.ts, 10) < cutoff);
+    }
+
+    removeWithScrollAnchor(toRemove);
+  }
+
   function trimDom() {
-    const selector = multiLangMode
-      ? '.multi-line-block'
-      : (display === 'paragraph' ? '.span-item' : '.line-item');
+    if (!multiLangMode && display === 'paragraph') {
+      trimParagraphChunks();
+      return;
+    }
+
+    const selector = multiLangMode ? '.multi-line-block' : '.line-item';
 
     // Absolute ceiling regardless of scroll position — a pure memory safety
     // valve for a viewer left scrolled away for a very long time. Set well
@@ -616,9 +722,8 @@ CAPTION_HTML = r"""<!DOCTYPE html>
     // scroll-back-through-history session.
     const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
     let items = linesDiv.querySelectorAll(selector);
-    let hardExcess = items.length - HARD_CAP;
-    for (let i = 0; i < hardExcess; i++) {
-      items[i].remove();
+    if (items.length > HARD_CAP) {
+      removeWithScrollAnchor(Array.from(items).slice(0, items.length - HARD_CAP));
     }
 
     // Everything below only runs while pinned to the live edge, so we never
@@ -661,10 +766,18 @@ CAPTION_HTML = r"""<!DOCTYPE html>
 
       lastUpdated = data.updated;
 
-      const allLines = data.lines;
-      const newLines = allLines.slice(lastCount);
+      // The server keeps only a recent window of lines: start is the absolute
+      // index of the window's first line, total counts every line ever pushed.
+      const start = data.start || 0;
+      const total = data.total || data.lines.length;
+      if (total < lastCount) {
+        // Server restarted mid-service — its counter is behind ours. Resync
+        // to the window start so the fresh backlog still renders.
+        lastCount = start;
+      }
+      const newLines = data.lines.slice(Math.max(0, lastCount - start));
 
-      lastCount = allLines.length;
+      lastCount = total;
 
       let appended = false;
 
@@ -740,7 +853,9 @@ class _CaptionHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_caption_server(port: int):
-    server = http.server.HTTPServer(("", port), _CaptionHandler)
+    # Threading: every phone in the congregation polls continuously; with a
+    # single-threaded server one slow client stalls everyone else's captions.
+    server = http.server.ThreadingHTTPServer(("", port), _CaptionHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
