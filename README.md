@@ -62,7 +62,7 @@ If you have the sermon outline ahead of time, pass it with `--outline` to give C
 python main.py --outline path/to/sermon.txt
 ```
 
-- The file must be UTF-8 plain text, or a Word .docx file (which will be converted to plain text). Any `.txt` with bullet points, verse references, or prose works. For a multilingual sermon, use a single multilingual outline; it is attached verbatim to every target worker's system prompt.
+- On the command line, `--outline` takes a **UTF-8 plain-text** file. (The control panel additionally accepts a Word `.docx` upload, which it converts to text in the browser before sending — so `.docx` works from the panel, not from the `--outline` flag.) Any `.txt` with bullet points, verse references, or prose works. For a multilingual sermon, use a single multilingual outline; it is attached verbatim to every target worker's system prompt.
 - Caching activates only when the combined system prompt + outline exceeds 1024 tokens (roughly 700–800 words). Below that, the script warns on stderr and runs without caching.
 - With multiple `--target` languages, each target worker caches its own system-prompt + outline independently and has its own keep-alive ping. Expect one `Cache warmed` message per cached worker at startup.
 - The cache has a 5-minute lifetime between calls. A keep-alive ping fires every 4m30s of silence so the cache survives long pauses.
@@ -74,9 +74,9 @@ python main.py --outline path/to/sermon.txt
 
 The recommended way to run this is via the included Automator app (`launcher.sh`), which:
 
-1. Starts `control_server.py` (the volunteer control panel) in the background
+1. Clears any stale Cloudflare tunnel left behind by a previous ungraceful shutdown, then starts `control_server.py` (the volunteer control panel) in the background
 2. Opens `http://localhost:9090` in Chrome
-3. Exits cleanly when the browser tab is closed or the volunteer clicks **Stop & Close Server**
+3. Cleanly stops the translation session **and its Cloudflare tunnel** on shutdown — whether the volunteer clicks **Stop & Close Server**, closes the browser tab, or quits the browser entirely
 
 To set it up:
 
@@ -84,6 +84,8 @@ To set it up:
 2. Add a **Run Shell Script** action (Shell: `/bin/bash`, Pass input: as arguments)
 3. Paste the contents of `launcher.sh`
 4. Save as an `.app` and pin it to the Dock
+
+> **Maintenance note:** the `.app` embeds a *copy* of `launcher.sh` (inside `Contents/document.wflow`), and it is gitignored so each machine keeps its own. If you edit `launcher.sh`, rebuild the app from the new script — or update the embedded copy and re-sign the bundle — otherwise the running app keeps using the old version.
 
 From the control panel at `http://localhost:9090`, volunteers can select the audio device, source/target languages, optionally upload a sermon outline, and start/stop the translation session.
 
@@ -163,7 +165,20 @@ Viewers can access:
 
 ### Waiting page
 
-When the tunnel has no origin (i.e. no device is running `main.py`), visitors to `live.rctranslation.org` see Cloudflare's default 530 error. To replace that with a branded "Waiting for transcription…" page that auto-refreshes into captions when the tunnel comes back online, deploy the Cloudflare Worker in `worker/`. See `[worker/README.md](worker/README.md)` for the one-time deploy.
+When the tunnel has no origin (i.e. no device is running `main.py`), visitors to `live.rctranslation.org` see Cloudflare's default 530 error. To replace that with a branded "Waiting for transcription…" page that auto-refreshes into captions when the tunnel comes back online, deploy the Cloudflare Worker in `worker/`. See [worker/README.md](worker/README.md) for the one-time deploy.
+
+### Troubleshooting: stale tunnels
+
+All devices share one named tunnel (`church-live`). Cloudflare treats multiple running `cloudflared` instances as replicas and load-balances across all of them, with **no awareness of which origin is actually serving captions**. So if a device leaves a `cloudflared` running after its caption server is gone, viewers of `live.rctranslation.org` hit that dead origin for a share of requests — the classic "captions only show up about half the time" symptom.
+
+The control panel now prevents this on its own: it tears the tunnel down on every shutdown path, and clears a stale one on launch (see **Application** above). If you still suspect a leftover tunnel:
+
+```bash
+pgrep -fa "cloudflared tunnel run"   # list tunnels running on THIS device
+pkill -f "cloudflared tunnel run"    # kill them
+```
+
+This is **per-device** — it cannot clear a stale tunnel on a *different* machine. If another device is holding the shared tunnel, that machine must be cleaned (relaunch its control panel, which self-heals, or run `pkill` there). Making one device authoritative regardless of the others is a larger change (design sketches are kept locally in `docs/multi-device-streaming.md`, not committed).
 
 ## CLI Options
 
@@ -187,12 +202,12 @@ When the tunnel has no origin (i.e. no device is running `main.py`), visitors to
 
 The codebase splits into a shared shell plus per-backend modules:
 
-- `main.py` — shared infrastructure: audio capture, web caption server, Cloudflare tunnel, prompt-building scaffolding, the LLM-agnostic `TranslationWorker` (queue/`[SKIP]`/rolling context), orchestration, and CLI. It loads the requested transcription and translation modules lazily via `importlib`, so a deployment using only e.g. `azure` + `gemini` backends would not pull in `websockets` or `anthropic`.
+- `main.py` — shared infrastructure: audio capture, web caption server, Cloudflare tunnel (torn down on `SIGINT`/`SIGTERM` so it never outlives the session), prompt-building scaffolding, the LLM-agnostic `TranslationWorker` (queue/`[SKIP]`/rolling context), orchestration, and CLI. It loads the requested transcription and translation modules lazily via `importlib`, so a deployment using only e.g. `azure` + `gemini` backends would not pull in `websockets` or `anthropic`.
 - `transcribe_soniox.py` — Soniox transcription backend: WebSocket session, audio pump, recv/gating loop, term lists, and the `[Transcription]` print. Imports `websockets`.
 - `translate_claude.py` — Claude translation backend: per-target system prompt, ephemeral cache eligibility check, cache warmup, keepalive thread, and the `messages.create` translation call. Imports `anthropic`.
-- `control_server.py` — Volunteer control panel server (`http://localhost:9090`). Serves `control.html`, manages the `main.py` subprocess, and shuts itself down when the browser tab closes.
-- `control.html` — Volunteer UI: device selection, source/target language picker, optional sermon outline upload, start/stop controls, and live caption viewer links.
-- `launcher.sh` — Automator shell script: starts LadioCast, launches `control_server.py`, opens Chrome, and waits — exiting cleanly when the server shuts down.
+- `control_server.py` — Volunteer control panel server (`http://localhost:9090`). Serves `control.html`, manages the `main.py` subprocess (stopping it — and its Cloudflare tunnel — cleanly), and shuts itself down when the browser tab closes.
+- `control.html` — Volunteer UI: device selection, source/target language picker, optional sermon outline upload (`.txt` or in-browser `.docx` conversion), start/stop controls, and live caption viewer links.
+- `launcher.sh` — Automator shell script: reaps any stale Cloudflare tunnel, launches `control_server.py`, opens Chrome, and waits — cleaning up the servers and tunnel when the panel shuts down.
 
 Alternative backends drop in alongside without modifying the main file beyond extending the `--transcriber` / `--translator` choice lists. They must implement these contracts:
 

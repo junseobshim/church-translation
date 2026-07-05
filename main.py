@@ -1,11 +1,13 @@
 import json
 import os
 import re
+import shutil
 import sys
 import queue
 import time
 import threading
 import argparse
+import signal
 import subprocess
 import http.server
 import importlib
@@ -747,10 +749,31 @@ def start_caption_server(port: int):
 # ── Cloudflare Tunnel ─────────────────────────────────────────────────────────
 
 
+def _resolve_cloudflared() -> str:
+    """Locate the cloudflared binary.
+
+    GUI-launched apps (e.g. the Automator control-panel app) inherit a minimal
+    PATH from launchd that omits Homebrew's bin directory, so a bare
+    "cloudflared" lookup raises FileNotFoundError even when it is installed. Fall
+    back to the common Homebrew install locations before giving up.
+    """
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"):
+        if os.path.exists(candidate):
+            return candidate
+    raise RuntimeError(
+        "cloudflared not found on PATH or in /opt/homebrew/bin, /usr/local/bin. "
+        "Install it (`brew install cloudflared`) or run with --no-tunnel."
+    )
+
+
 def start_cloudflare_tunnel(tunnel_name: str, port: int):
     """Launch cloudflared as a subprocess for a named tunnel."""
+    cloudflared = _resolve_cloudflared()
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "run", "--url", f"http://localhost:{port}", tunnel_name],
+        [cloudflared, "tunnel", "run", "--url", f"http://localhost:{port}", tunnel_name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1034,6 +1057,11 @@ def main():
     if anthropic_api_key is None:
         raise RuntimeError("Missing ANTHROPIC_API_KEY. Set it in .env or environment.")
 
+    # Optional model override from the environment (e.g. CLAUDE_MODEL in .env, loaded
+    # above). Falls back to the translation backend's DEFAULT_MODEL. Read here, after
+    # load_dotenv, so a value set only in .env is honored.
+    model = os.environ.get("CLAUDE_MODEL") or tl_mod.DEFAULT_MODEL
+
     if args.device is not None:
         device_index = args.device
         dev = sd.query_devices(device_index)
@@ -1046,20 +1074,54 @@ def main():
         start_caption_server(args.port)
         print(f"Web captions: http://localhost:{args.port}")
 
+    # The launcher starts control_server.py backgrounded (`… &`), which sets this
+    # process tree's SIGINT disposition to SIG_IGN; main.py inherits it through
+    # Popen. Without re-installing handlers, control_server's SIGINT-based stop is
+    # silently ignored — it then falls back to SIGTERM, whose default action kills
+    # this process WITHOUT running the finally below, orphaning the cloudflared
+    # tunnel (which keeps competing for the shared named tunnel and breaks routing
+    # for other devices). Re-installing a handler for both signals overrides the
+    # inherited SIG_IGN and routes either signal through the finally so the tunnel
+    # is always torn down. Installed before the tunnel starts so no signal can
+    # arrive with a tunnel up but no handler yet.
+    def _graceful_shutdown(signum, frame):
+        # One-shot: ignore further signals once teardown has begun. A second
+        # signal (e.g. control_server's SIGTERM fallback after its 5s SIGINT
+        # timeout) would otherwise raise inside the finally below and abort it
+        # before the tunnel is terminated.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+
     tunnel_proc = None
     if args.tunnel and not args.no_tunnel:
-        tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
-        print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
+        try:
+            tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
+            print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
+        except (RuntimeError, OSError) as e:
+            print(f"Warning: could not start Cloudflare tunnel: {e}\n"
+                  f"Continuing with local captions only at http://localhost:{args.port}.",
+                  file=sys.stderr)
 
     try:
         print(f"Translation mode: {args.source} → {', '.join(targets)}")
         run_session(api_key, device_index, anthropic_api_key,
                     source=args.source, targets=targets, outline=outline_text,
                     transcriber_cls=tx_mod.Transcriber, backend_cls=tl_mod.Backend,
-                    make_client_fn=tl_mod.make_client, model=tl_mod.DEFAULT_MODEL)
+                    make_client_fn=tl_mod.make_client, model=model)
     finally:
         if tunnel_proc:
             tunnel_proc.terminate()
+            # 3s keeps a normal stop inside control_server's 5s SIGINT window;
+            # kill() covers a cloudflared that ignores SIGTERM (the launcher's
+            # pkill backstop is also SIGTERM, so it couldn't reap that either).
+            try:
+                tunnel_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                tunnel_proc.kill()
 
 
 if __name__ == "__main__":

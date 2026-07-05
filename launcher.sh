@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 
 # ─────────────────────────────────────────────────────────────
 # RC Church Translation Launcher
@@ -31,6 +31,12 @@ cleanup() {
     lsof -ti :"$CONTROL_PORT" | xargs kill -9 2>/dev/null
     lsof -ti :"$CAPTION_PORT" | xargs kill -9 2>/dev/null
 
+    # cloudflared holds no local listening port — it makes outbound-only
+    # connections to Cloudflare's edge — so the port-based kills above never catch
+    # it. Reap it by name so quitting the app mid-session doesn't leave the tunnel
+    # registered and competing for the shared named tunnel.
+    pkill -f "cloudflared tunnel run.*church-live" 2>/dev/null
+
     echo "[Launcher] Done."
 }
 
@@ -54,6 +60,10 @@ if [ ! -d "venv" ]; then
     exit 1
 fi
 
+# GUI-launched apps (Automator) inherit a minimal PATH from launchd that omits
+# Homebrew — so tools like cloudflared aren't found. Add the common locations.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 source venv/bin/activate
 
 # ─────────────────────────────────────────────────────────────
@@ -63,6 +73,18 @@ source venv/bin/activate
 if lsof -i :"$CONTROL_PORT" >/dev/null 2>&1; then
     echo "[Launcher] Control server already running."
 else
+    # Self-heal: if a previous session died ungracefully (force-quit, logout,
+    # power loss), it may have orphaned a cloudflared tunnel that is still
+    # competing for the shared named tunnel. We are starting fresh — no control
+    # server is running on this device — so any leftover cloudflared here is
+    # stale. Clear it before we begin. (Guarded by the `else`: if a session were
+    # already live, we would not want to kill its tunnel.)
+    pkill -f "cloudflared tunnel run.*church-live" 2>/dev/null
+
+    # Same for a stale main.py still holding the caption port — a new session
+    # would otherwise fail to bind 8080 and die at Start.
+    lsof -ti :"$CAPTION_PORT" | xargs kill -9 2>/dev/null
+
     venv/bin/python3 control_server.py \
         > /tmp/rc_translation.log 2>&1 &
 
