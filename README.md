@@ -89,7 +89,7 @@ To set it up:
 
 From the control panel at `http://localhost:9090`, volunteers can select the audio device, source/target languages, optionally upload a sermon outline, and start/stop the translation session.
 
-> **Logs:** When launched via the `.app`, `launcher.sh` sends all output to **`/tmp/rc_translation.log`** — both the control server and the translation session (`main.py`) write there. Note two things: the file is **truncated on every launch** (each run overwrites the last), and `/tmp` is cleared on reboot. So if a session fails (e.g. a "Failed to fetch" error when clicking Start), copy the log *before* relaunching: `cp /tmp/rc_translation.log ~/Desktop/`. When you instead run `control_server.py` or `main.py` by hand in a terminal, output goes to that terminal, not the file.
+> **Logs:** When launched via the `.app`, `launcher.sh` sends all output to **`/tmp/rc_translation.<username>.log`** (per-user, so two macOS accounts on the same Mac don't collide) — both the control server and the translation session (`main.py`) write there. Note two things: the file is **truncated on every launch** (each run overwrites the last), and `/tmp` is cleared on reboot. So if a session fails (e.g. a "Failed to fetch" error when clicking Start), copy the log *before* relaunching: `cp /tmp/rc_translation.$USER.log ~/Desktop/`. When you instead run `control_server.py` or `main.py` by hand in a terminal, output goes to that terminal, not the file.
 
 ## Web Display
 

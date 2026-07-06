@@ -16,8 +16,6 @@ venv/
 # Claude Code
 .claude/
 
-# Misc files
-llms-full.txt
 
 # Cloudflare Workers
 worker/.wrangler/

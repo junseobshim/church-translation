@@ -21,11 +21,23 @@ CAPTION_PORT="${CAPTION_PORT:-8080}"
 
 CONTROL_URL="http://localhost:${CONTROL_PORT}"
 
+# Per-user log path. /tmp is shared across macOS accounts and survives logout,
+# so a log created by one user (mode 644) is unwritable by another — the `>`
+# redirect below would then fail and the control server would never start.
+LOG_FILE="/tmp/rc_translation.${USER:-$(id -un)}.log"
+
 # ─────────────────────────────────────────────────────────────
 # Cleanup on exit
 # ─────────────────────────────────────────────────────────────
 
 cleanup() {
+    # Only tear down what this instance started. If the server was already
+    # running (double-launch / reattach), we only opened Chrome — killing the
+    # ports and tunnel here would destroy the live session.
+    if [ -z "$SERVER_PID" ]; then
+        return 0
+    fi
+
     echo "[Launcher] Shutting down servers…"
 
     lsof -ti :"$CONTROL_PORT" | xargs kill -9 2>/dev/null
@@ -85,8 +97,8 @@ else
     # would otherwise fail to bind 8080 and die at Start.
     lsof -ti :"$CAPTION_PORT" | xargs kill -9 2>/dev/null
 
-    venv/bin/python3 control_server.py \
-        > /tmp/rc_translation.log 2>&1 &
+    venv/bin/python3 control_server.py --port "$CONTROL_PORT" \
+        > "$LOG_FILE" 2>&1 &
 
     SERVER_PID=$!
 
@@ -95,6 +107,13 @@ fi
 
 # Wait for server startup
 sleep 4
+
+# Surface a failed startup (port conflict, broken venv) instead of opening
+# Chrome on a dead port.
+if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    osascript -e "display alert \"Translation control server failed to start\" message \"Check ${LOG_FILE} for details.\""
+    exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────
 # Open control panel

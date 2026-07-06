@@ -11,37 +11,7 @@ immediately.
 
 ---
 
-## 1. `launcher.sh`: relaunching while a session is live kills the live session
-
-**What happens:** if the launcher runs while the control server is already up
-(port 9090 busy), it takes the "already running" branch, opens Chrome, then
-falls off the end of the script — `SERVER_PID` is empty so the `wait` is
-skipped. Exiting fires the `trap cleanup EXIT`, which `kill -9`s whatever holds
-ports 9090 and 8080 and pkills the tunnel — i.e. it destroys the *live*
-session it just attached to, and leaves Chrome showing a dead panel.
-
-The "already running" branch therefore defeats its own purpose. This can
-realistically happen when the launcher process died (force-quit, logout) but
-the servers survived, and the volunteer relaunches the Dock app to reattach.
-
-**Fix sketch:** only clean up what this instance started. Set a flag when this
-launcher instance starts the server and make `cleanup()` a no-op otherwise:
-
-```bash
-STARTED_BY_ME=0
-# in the else-branch that starts control_server.py:
-STARTED_BY_ME=1
-
-cleanup() {
-    [ "$STARTED_BY_ME" = "1" ] || return 0
-    ...existing kills...
-}
-```
-
-(Alternative: `trap - EXIT TERM INT` inside the already-running branch, then
-either exit or `wait` on the existing server some other way.)
-
-## 2. Control server is exposed to the whole LAN
+## 1. Control server is exposed to the whole LAN
 
 `control_server.py` binds `HTTPServer(("", 9090), …)` — all interfaces. Anyone
 on the church Wi-Fi can hit `/api/start`, `/api/stop`, `/api/shutdown` and
@@ -62,7 +32,7 @@ ProPresenter (or any TV/other machine on the LAN) fetches captions directly
 from this Mac by IP. Verify before changing that one; cloudflared itself only
 needs localhost.
 
-## 3. Caption viewer, multi-lang mode: timer-path flush never scrolls
+## 2. Caption viewer, multi-lang mode: timer-path flush never scrolls
 
 In `CAPTION_HTML` (main.py), `flushGroup()` has two callers:
 
@@ -81,7 +51,7 @@ blank gap for up to 6 s before the group flushes. Appending the wrapper at
 flush time instead would fix it (group order can still be preserved by
 tracking creation order).
 
-## 4. `control_server._handle_stop`: no escalation past SIGTERM, no reap
+## 3. `control_server._handle_stop`: no escalation past SIGTERM, no reap
 
 After `send_signal(SIGINT)` + `wait(timeout=5)` fails, it calls `terminate()`
 and immediately sets `_session_proc = None` without waiting:
@@ -108,7 +78,7 @@ except subprocess.TimeoutExpired:
 Same pattern applies to the shutdown path in `control_server.main()`'s
 `finally`.
 
-## 5. `threading.excepthook = lambda args: None` swallows all thread errors
+## 4. `threading.excepthook = lambda args: None` swallows all thread errors
 
 `main.py:18` silences *every* uncaught exception in *every* thread, forever —
 not just the Ctrl+C noise it was added for. A crashed caption-server thread or
@@ -124,7 +94,7 @@ def _quiet_interrupts(args):
 threading.excepthook = _quiet_interrupts
 ```
 
-## 6. Soniox token lists grow without bound
+## 5. Soniox token lists grow without bound
 
 `transcribe_soniox.py` — `final_tokens` / `final_translation_tokens` accumulate
 every token for the whole session; only the new slice
@@ -137,7 +107,7 @@ final_tokens[:prev_final_count]` and reset both counters; same for the
 translation list — mind that the reconnect logic relies only on counts, which
 rebasing preserves).
 
-## 7. Housekeeping
+## 6. Housekeeping
 
 - **`kill -9` by port in `launcher.sh` cleanup** can kill an unrelated process
   that happens to be squatting 8080/9090 (Docker, another dev server) on a

@@ -1309,6 +1309,14 @@
     }
   });
 
+  // Explicit goodbye on real unload — tab/window close, Chrome quit, reload,
+  // or navigation. pagehide does NOT fire on hide/minimize/focus loss, so a
+  // backgrounded panel never triggers this. The server waits a short grace
+  // period and cancels the shutdown if we reconnect (reload, duplicate tab).
+  window.addEventListener('pagehide', () => {
+    navigator.sendBeacon('/api/goodbye');
+  });
+
   // Also use the Page Visibility + wakeLock API if available to discourage
   // Chrome from throttling the tab's timers during a live session.
   let _wakeLock = null;
