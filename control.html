@@ -191,6 +191,13 @@
     background: var(--green);
   }
 
+  /* Disabled: e.g. English target while the source is English-only. */
+  .target-chip.disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+
   /* Device selector */
   .device-select {
     width: 100%;
@@ -973,64 +980,78 @@
     btn.classList.add('active');
     source = btn.dataset.source;
 
-    // Multi forces all targets
     if (source === 'multi') {
+      // Multi always translates into all three; lock the target card.
       targets = new Set(['ko', 'en', 'es']);
-      document.querySelectorAll('.target-chip').forEach(chip => {
-        chip.classList.add('active');
-        chip.querySelector('input').checked = true;
-      });
       document.getElementById('targetCard').style.pointerEvents = 'none';
     } else {
       document.getElementById('targetCard').style.pointerEvents = 'auto';
-      // Remove source lang from targets if present
-      if (targets.has(source)) {
-        targets.delete(source);
-        const chip = document.querySelector(`.target-chip[data-lang="${source}"]`);
-        if (chip) {
-          chip.classList.remove('active');
-          chip.querySelector('input').checked = false;
-        }
-      }
-      // Default: at least one target
-      if (targets.size === 0) {
-        const fallback = source === 'en' ? 'ko' : 'en';
-        targets.add(fallback);
-        const chip = document.querySelector(`.target-chip[data-lang="${fallback}"]`);
-        if (chip) {
-          chip.classList.add('active');
-          chip.querySelector('input').checked = true;
-        }
-      }
+      // Keep the current targets across a source switch — a bilingual source
+      // (ko+en, es+en) may include its base language as a target (passthrough).
+      // English-only source can never target English, so drop it. Then ensure at
+      // least one target remains.
+      if (source === 'en') targets.delete('en');
+      if (targets.size === 0) targets.add(source === 'en' ? 'ko' : 'en');
     }
-    updateCmd();
+    refreshTargets();
   }
 
   // ── Target chips ───────────────────────────────────────────────────────────
-  function updateTargets() {
-    targets = new Set();
+  // `targets` (a Set) is the source of truth; these helpers reconcile the chip
+  // DOM and the validity hint from it.
+
+  // A target language is selectable unless it's English while the source is
+  // English-only (English → English does nothing). Bilingual sources (ko+en,
+  // es+en) may target their own base language for same-language passthrough.
+  function targetAllowed(lang) {
+    return !(source === 'en' && lang === 'en');
+  }
+
+  // Write the `targets` Set into the chip DOM (checkbox, active + disabled).
+  function syncChips() {
     document.querySelectorAll('.target-chip').forEach(chip => {
-      const cb = chip.querySelector('input');
-      if (cb.checked) {
-        chip.classList.add('active');
-        targets.add(chip.dataset.lang);
-      } else {
-        chip.classList.remove('active');
-      }
+      const lang = chip.dataset.lang;
+      const allowed = targetAllowed(lang);
+      const on = allowed && targets.has(lang);
+      chip.classList.toggle('disabled', !allowed);
+      chip.querySelector('input').checked = on;
+      chip.classList.toggle('active', on);
     });
-    document.getElementById('targetError').style.display = targets.size === 0 ? 'block' : 'none';
+  }
+
+  // Valid when at least one target is selected and none is disallowed for the
+  // source (only en under an English-only source is disallowed).
+  function targetsValid() {
+    if (targets.size === 0) return false;
+    if (source === 'en' && targets.has('en')) return false;
+    return true;
+  }
+
+  // Reconcile chip DOM, the inline hint, and the command preview from `targets`.
+  function refreshTargets() {
+    syncChips();
+    const err = document.getElementById('targetError');
+    err.textContent = 'Select at least one target language';
+    err.style.display = targets.size === 0 ? 'block' : 'none';
     updateCmd();
   }
 
   document.querySelectorAll('.target-chip').forEach(chip => {
-    chip.addEventListener('click', function() {
-      if (source === 'multi') return;
-      const cb = this.querySelector('input');
-      const willBeChecked = !cb.checked;
-      // Prevent deselecting if it's the last active one
-      if (!willBeChecked && targets.size === 1 && targets.has(this.dataset.lang)) return;
-      cb.checked = willBeChecked;
-      updateTargets();
+    chip.addEventListener('click', function(e) {
+      // The chip is a <label> around a hidden checkbox; without this the click
+      // also fires on the forwarded checkbox, double-invoking this handler and
+      // cancelling the toggle. State lives in `targets`, not the checkbox.
+      e.preventDefault();
+      if (source === 'multi') return;  // multi locks all three on
+      const lang = this.dataset.lang;
+      if (!targetAllowed(lang)) return;  // e.g. en under English-only source
+      if (targets.has(lang)) {
+        if (targets.size === 1) return;  // keep at least one target
+        targets.delete(lang);
+      } else {
+        targets.add(lang);
+      }
+      refreshTargets();
     });
   });
 
@@ -1193,7 +1214,12 @@
     }
 
     // Validate
-    if (targets.size === 0) { showError('Select at least one target language.'); return; }
+    if (!targetsValid()) {
+      showError(targets.size === 0
+        ? 'Select at least one target language.'
+        : 'English source cannot translate into English.');
+      return;
+    }
 
     // Save outline if provided
     const outline = document.getElementById('outlineText').value.trim();

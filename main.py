@@ -37,7 +37,7 @@ SOURCE_LANGS = {
     "ko":    ["ko", "en"],
     "en":    ["en"],
     "es":    ["es", "en"],
-    "multi": ["ko", "en", "es", "zh"],
+    "multi": ["ko", "en", "es"],
 }
 
 # Fallback tag when render_tokens emits text with no [xx] language prefix
@@ -55,7 +55,6 @@ FILLER_CLAUSE_BY_LANG = {
     "ko": "Korean hesitation fillers (아, 어)",
     "en": "English hesitation fillers (uh, um, like, you know, so, I mean)",
     "es": "Spanish hesitation fillers (eh, este, pues, o sea, bueno)",
-    "zh": "Chinese hesitation fillers (那个, 嗯, 就是, 这个)",
 }
 
 BIBLE_BY_TARGET = {
@@ -81,6 +80,12 @@ TERM_PREFS_BY_PAIR = {
     ("en", "es"):    "",
     ("es", "en"):    "",
     ("es", "ko"):    "",
+    # Same-language targets: a bilingual source (ko+en or es+en) may also select
+    # its base language as a target, so matching segments pass through unchanged
+    # and no proper-noun overrides apply. --source en is pure English and never
+    # targets en, so there is no (en, en) entry.
+    ("ko", "ko"):    "",
+    ("es", "es"):    "",
     # multi → any: use ko-specific prefs since 정목사 only appears in Korean speech.
     ("multi", "en"): "여러분 → everyone; 정목사 → Pastor Chung.",
     ("multi", "es"): "여러분 → todos; 정목사 → Pastor Chung.",
@@ -91,7 +96,7 @@ SOURCE_COMPOSITION = {
     "ko":    "Korean (with occasional English)",
     "en":    "English",
     "es":    "Spanish (with occasional English)",
-    "multi": "mixed Korean, English, and Spanish (with occasional Chinese)",
+    "multi": "mixed Korean, English, and Spanish",
 }
 
 OUTLINE_WRAPPER = (
@@ -1088,7 +1093,12 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str,
 
 def _parse_and_validate_targets(source: str, target_arg: Optional[str]) -> list[str]:
     """Resolve --target against --source. Returns the validated target list in
-    the order specified by the user (first target becomes the web default)."""
+    the order specified by the user (first target becomes the web default).
+
+    A target may equal a source language when that source is bilingual (ko+en or
+    es+en): matching segments pass through untranslated, exactly as --source
+    multi already handles ko/en/es. --source en is pure English, so it can never
+    target en (English → English does nothing)."""
     ALL = {"ko", "en", "es"}
     DEFAULTS = {"ko": "en", "multi": "ko,en,es"}
 
@@ -1098,17 +1108,18 @@ def _parse_and_validate_targets(source: str, target_arg: Optional[str]) -> list[
         target_arg = DEFAULTS[source]
 
     targets = [t.strip() for t in target_arg.split(",") if t.strip()]
+    tset = set(targets)
 
     if source == "multi":
-        if set(targets) != ALL or len(targets) != 3:
+        if tset != ALL or len(targets) != 3:
             sys.exit("--source multi requires --target ko,en,es (all three)")
         return targets
 
-    allowed = ALL - {source}
-    if source in targets:
-        sys.exit(f"--target cannot include --source ({source})")
-    if not targets or not set(targets).issubset(allowed):
-        sys.exit(f"--target must be a non-empty subset of {sorted(allowed)}")
+    if not targets or not tset.issubset(ALL):
+        sys.exit(f"--target must be a non-empty subset of {sorted(ALL)}")
+    if source == "en" and "en" in tset:
+        sys.exit("--source en cannot target en (English → English does nothing); "
+                 "choose ko and/or es")
     return targets
 
 
