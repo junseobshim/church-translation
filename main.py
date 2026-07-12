@@ -396,6 +396,12 @@ CAPTION_HTML = r"""<!DOCTYPE html>
   const mode = params.get('mode') || 'translation';
   const display = params.get('display') || 'line';
 
+  // hideStatus=1 suppresses status/waiting chrome for embeds & OBS overlays.
+  // The Cloudflare Worker already honours it for its server-down fallback
+  // page; honour it here too so the idle "Waiting for transcription…" overlay
+  // stays hidden while the server is up but no captions have arrived yet.
+  const hideStatus = params.get('hideStatus') === '1';
+
   // Multi-language support:
   // ?langs=en,ko,es
   // Each language renders on its own line inside the same caption block.
@@ -480,6 +486,13 @@ CAPTION_HTML = r"""<!DOCTYPE html>
 
   let overlayDismissed = false;
   let hasReceivedData = false;
+
+  if (hideStatus) {
+    // display:none (not the .hidden opacity transition) so there's no fade
+    // flash on load; overlayDismissed keeps the data path from re-showing it.
+    overlayDismissed = true;
+    overlay.style.display = 'none';
+  }
 
   const DOM_CAP = 200;
 
