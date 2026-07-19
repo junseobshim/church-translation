@@ -41,10 +41,11 @@ SOURCE_CONTEXT = {
 def build_soniox_config(source: str, api_key: str) -> dict:
     """Build the initial-frame JSON for the Soniox STT websocket.
 
-    `translation.target_language` is fixed at `zh` across all sources — Soniox
+    `translation.target_language` is fixed at `af` across all sources — Soniox
     translation tokens are used only as a phrase-boundary gating signal; the
-    translated text is discarded. Pivoting to an unused language keeps this
-    config source-agnostic.
+    translated text is discarded. The pivot must be a language no speaker will
+    use: a source segment already in the target language produces no translation
+    tokens, so it would never trip the gate. `af` is unused across all sources.
     """
     topic, text = SOURCE_CONTEXT[source]
     return {
@@ -59,7 +60,7 @@ def build_soniox_config(source: str, api_key: str) -> dict:
         "num_channels": 1,
         "translation": {
             "type": "one_way",
-            "target_language": "zh",
+            "target_language": "af",
         },
         "context": {
             "general": [
