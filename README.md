@@ -115,7 +115,7 @@ Open in any browser or ProPresenter Web Fill:
 
 
 | Param         | Default                                                                 | Description                                                                                                                                                                           |
-| ------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `mode`        | `transcription`                                                         | `transcription` or `translation`                                                                                                                                                      |
 | `lang`        | first `--target` for translation mode; no filter for transcription mode | ISO 639-1 language filter. In transcription mode, omitting `lang` shows all languages as spoken; in translation mode it defaults to the first `--target`. Explicit value always wins. |
 | `display`     | `line`                                                                  | `line` (block divs) or `paragraph` (inline spans)                                                                                                                                     |

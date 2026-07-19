@@ -203,6 +203,24 @@ def _encode_web_state() -> bytes:
 _web_json_cache = _encode_web_state()
 
 
+def _encode_web_state() -> bytes:
+    """Caller must hold _web_lock (except at import time)."""
+    lines = list(_web_state["lines"])
+    return json.dumps({
+        "lines": lines,
+        "start": _web_state["total"] - len(lines),
+        "total": _web_state["total"],
+        "updated": _web_state["updated"],
+    }).encode()
+
+
+# Pre-encoded /api/latest response, rebuilt once per appended line. Viewer
+# polls just grab these bytes instead of re-serializing the state under
+# _web_lock on every request, which would block the transcription/translation
+# threads pushing new lines.
+_web_json_cache = _encode_web_state()
+
+
 def _update_web_state(kind: str, lang: str, text: str):
     """kind='transcription' or 'translation', lang='en'/'ko'/'es'/…"""
     global _web_json_cache

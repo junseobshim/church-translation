@@ -29,10 +29,22 @@
   };
 
   const DOM_CAP = 200;
-  const FAST_MS = 150;
+  // Phrases arrive every few seconds, so 300ms polling still feels instant;
+  // faster only multiplies load by every phone in the congregation.
+  const FAST_MS = 300;
   const MAX_MS = 1000;
   const GROWTH = 1.5;
   const GROUP_WINDOW_MS = 6000;
+
+  // Paragraph-mode trim batching. Each trim forces a layout for the line
+  // measurements (see trimParagraphLines), and with per-span granularity the
+  // oldest span crosses the history cutoff continuously — so require the
+  // oldest span to be this far *past* the cutoff before trimming back to it.
+  // Trims stay occasional; history stays at least HISTORY_MS.
+  const AGE_BATCH_MS = 30000;
+  // Same idea for the hard cap, in span counts: without a margin every new
+  // phrase over the cap would trigger a trim on the next poll.
+  const HARD_CAP_BATCH = 25;
 
   // ── URL params ───────────────────────────────────────────────────────────
   // Session-only overrides, never written to localStorage. Precedence is
@@ -78,6 +90,8 @@
   const rawColorOverride = params.get("color");
   const rawBgOverride = params.get("bgColor");
   const rawTextShadowOverride = params.get("textShadow");
+
+  const DEBUG_TRIM = params.get("debugTrim") === "1";
 
   // ── Settings store ───────────────────────────────────────────────────────
 
@@ -429,6 +443,30 @@
     });
   }
 
+  // Run a DOM mutation while keeping the viewport visually anchored: deleting
+  // content above the fold shifts everything up by its height, so shift a
+  // scrolled-back reader's scrollTop up by the same amount. While pinned the
+  // browser's own scrollTop clamping keeps the view glued to the live edge.
+  function mutateWithScrollAnchor(mutate) {
+    if (pinnedToBottom) {
+      mutate();
+      return;
+    }
+    const before = container.scrollHeight;
+    mutate();
+    const delta = before - container.scrollHeight;
+    if (delta > 0) {
+      container.scrollTo({ top: Math.max(0, container.scrollTop - delta), behavior: "instant" });
+    }
+  }
+
+  function removeWithScrollAnchor(els) {
+    if (els.length === 0) return;
+    mutateWithScrollAnchor(function () {
+      for (const el of els) el.remove();
+    });
+  }
+
   function makeLangLine(lang, text) {
     const div = document.createElement("div");
     div.className = "lang-line";
@@ -500,19 +538,175 @@
     }
   }
 
+  // Rect of the single character at [textNode, offset]. Rects come from the
+  // character's own font run, so tops on one rendered line can differ by a
+  // few px across mixed Korean/Latin fallback fonts — compare tops with
+  // lineTolerance(), never px-exact.
+  function charRect(textNode, offset) {
+    const r = document.createRange();
+    r.setStart(textNode, offset);
+    r.setEnd(textNode, offset + 1);
+    return r.getBoundingClientRect();
+  }
+
+  // Half the line advance: tops on the same line agree within a few px,
+  // tops on adjacent lines differ by the full line-height.
+  function lineTolerance() {
+    const cs = getComputedStyle(linesDiv);
+    let lh = parseFloat(cs.lineHeight);
+    // Numeric line-height may come back as the bare multiplier.
+    if (!isFinite(lh)) lh = 1.2 * parseFloat(cs.fontSize);
+    else if (lh < 4) lh *= parseFloat(cs.fontSize);
+    return lh / 2;
+  }
+
+  // Paragraph mode is one continuous flowing block; trims cut old content at
+  // a rendered-line boundary measured in this browser. Line wrapping is
+  // computed greedily from each line's start, so a cut exactly where a line
+  // already starts leaves every downstream wrap point unchanged — text the
+  // viewer can see never moves or re-wraps.
+  function trimParagraphLines() {
+    const spans = Array.from(linesDiv.children);
+    if (spans.length <= 1) return; // never trim the span still being written
+
+    // Pick the first span that must survive. Cheap counter/dataset math only
+    // — the geometry below runs only when there is something to remove.
+    let keep = 0;
+
+    // Absolute ceiling regardless of scroll position — a pure memory safety
+    // valve for a viewer left scrolled away for a very long time.
+    const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
+    if (spans.length > HARD_CAP + HARD_CAP_BATCH) {
+      keep = spans.length - HARD_CAP;
+    }
+
+    // Everything below only runs while pinned to the live edge, so we never
+    // yank content out from under someone who has scrolled back to read it.
+    if (pinnedToBottom) {
+      // Trim in batches: start only once well past the cap, then cut back to
+      // it, so trims happen once every several minutes instead of per poll.
+      const limit = maxLines > 0 ? maxLines : DOM_CAP;
+      if (spans.length > limit * 1.5) {
+        keep = Math.max(keep, spans.length - limit);
+      }
+
+      // Age-out, batched by AGE_BATCH_MS: a span older than the cutoff
+      // leaves only once the oldest span is well past it, so at least
+      // HISTORY_MS of history always remains.
+      const cutoff = Date.now() - HISTORY_MS;
+      if (parseInt(spans[0].dataset.ts, 10) < cutoff - AGE_BATCH_MS) {
+        while (keep < spans.length - 1 && parseInt(spans[keep].dataset.ts, 10) < cutoff) keep++;
+      }
+    }
+
+    keep = Math.min(keep, spans.length - 1);
+    if (keep <= 0) return;
+    cutAtLineStart(spans, keep);
+  }
+
+  // Cut everything before the start of the rendered line containing the
+  // first character of spans[keep] (keeping up to one extra line of aged
+  // content). Spans wholly before the cut are removed; if the cut falls
+  // mid-span, only the leading text is deleted — the element survives with
+  // its dataset.ts intact.
+  function cutAtLineStart(spans, keep) {
+    const tol = lineTolerance();
+    const targetNode = spans[keep].firstChild;
+    let cutSpan = keep;
+    let cutOffset = 0;
+    let measured = false;
+
+    if (targetNode && targetNode.length > 0) {
+      const targetTop = charRect(targetNode, 0).top;
+      const onTargetLine = (rect) => rect.top >= targetTop - tol;
+
+      // Character tops are monotonically non-decreasing in document order
+      // (within tol), so binary-search for the first position on the
+      // target's line: first across spans by first-char rect...
+      let lo = 0,
+        hi = keep;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (onTargetLine(charRect(spans[mid].firstChild, 0))) hi = mid;
+        else lo = mid + 1;
+      }
+      cutSpan = lo;
+      // ...then within the span before it, whose tail may share the line.
+      if (lo > 0) {
+        const tn = spans[lo - 1].firstChild;
+        let a = 1,
+          b = tn.length;
+        while (a < b) {
+          const m = (a + b) >> 1;
+          if (onTargetLine(charRect(tn, m))) b = m;
+          else a = m + 1;
+        }
+        if (a < tn.length) {
+          cutSpan = lo - 1;
+          cutOffset = a;
+        }
+      }
+
+      if (cutSpan === 0 && cutOffset === 0) return; // target line is the first line
+
+      // Sanity-check that the cut is a genuine line start: the previous
+      // character must sit a full line above. If measurement looks wrong
+      // (fonts mid-load, zero rects), fall through to the span-boundary
+      // fallback below.
+      const prevRect =
+        cutOffset > 0
+          ? charRect(spans[cutSpan].firstChild, cutOffset - 1)
+          : charRect(spans[cutSpan - 1].firstChild, spans[cutSpan - 1].firstChild.length - 1);
+      const cutRect =
+        cutOffset > 0
+          ? charRect(spans[cutSpan].firstChild, cutOffset)
+          : charRect(spans[cutSpan].firstChild, 0);
+      measured = prevRect.height > 0 && cutRect.height > 0 && cutRect.top - prevRect.top > tol;
+      if (DEBUG_TRIM) {
+        console.log("[trim]", {
+          keep,
+          cutSpan,
+          cutOffset,
+          measured,
+          targetTop,
+          prevTop: prevRect.top,
+          cutTop: cutRect.top,
+          spanCount: spans.length,
+        });
+        console.assert(measured, "trim cut is not a line start");
+      }
+    }
+
+    if (!measured) {
+      // Fallback: cut at the span boundary — one visible re-wrap, same as
+      // the pre-chunking behavior, but the DOM stays bounded.
+      cutSpan = keep;
+      cutOffset = 0;
+    }
+
+    mutateWithScrollAnchor(function () {
+      for (let i = 0; i < cutSpan; i++) spans[i].remove();
+      // Delete exactly the measured leading text — never normalize
+      // whitespace: #lines is pre-wrap, so changing content changes wrapping.
+      if (cutOffset > 0) spans[cutSpan].firstChild.deleteData(0, cutOffset);
+    });
+  }
+
   function trimDom() {
-    const selector = multiLangMode()
-      ? ".multi-line-block"
-      : display === "paragraph"
-      ? ".span-item"
-      : ".line-item";
+    if (!multiLangMode() && display === "paragraph") {
+      trimParagraphLines();
+      return;
+    }
+
+    const selector = multiLangMode() ? ".multi-line-block" : ".line-item";
 
     // Absolute ceiling regardless of scroll position — a pure memory safety
     // valve for a viewer left scrolled away for a very long time.
     const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
     let items = linesDiv.querySelectorAll(selector);
-    const hardExcess = items.length - HARD_CAP;
-    for (let i = 0; i < hardExcess; i++) items[i].remove();
+    if (items.length > HARD_CAP) {
+      removeWithScrollAnchor(Array.from(items).slice(0, items.length - HARD_CAP));
+    }
 
     // Everything below only runs while pinned to the live edge, so we never
     // yank content out from under someone who has scrolled back to read it.
