@@ -218,6 +218,10 @@ Alternative backends drop in alongside without modifying the main file beyond ex
 
 `websockets` is Soniox-only and `anthropic` is Claude-only at the import level — both are still required for the default Soniox + Claude path. Once optional backends ship, `requirements.txt` may split into extras keyed by backend.
 
+## Viewer settings panel
+
+The web display at `http://localhost:8080/` also ships a gear-icon settings panel (top right) for visitors who don't have a preset query-param link: a **View** dropdown (transcription or a specific target language), font family, font size, and a light/dark theme toggle. Choices persist per-browser via `localStorage` and don't affect the query-param links documented above, which still work unchanged and always take precedence — this is for the plain `http://localhost:8080/` / `live.rctranslation.org/` links people open directly. The panel and gear icon are hidden automatically whenever `hideStatus=1` is set, so ProPresenter web-fill links never show it.
+
 ## License
 
 Unlicense
