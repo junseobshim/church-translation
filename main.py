@@ -1,16 +1,22 @@
 import json
 import os
 import re
+import shutil
 import sys
 import queue
 import time
 import threading
 import argparse
+import signal
 import subprocess
 import http.server
 import importlib
+from collections import deque
 from typing import Callable, Optional
 from urllib.parse import urlparse
+
+# Static frontend assets for the caption viewer (see _CaptionHandler below).
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 # Suppress noisy thread exception tracebacks on Ctrl+C.
 threading.excepthook = lambda args: None
@@ -77,6 +83,12 @@ TERM_PREFS_BY_PAIR = {
     ("en", "es"):    "",
     ("es", "en"):    "",
     ("es", "ko"):    "",
+    # Same-language targets: a bilingual source (ko+en or es+en) may also select
+    # its base language as a target, so matching segments pass through unchanged
+    # and no proper-noun overrides apply. --source en is pure English and never
+    # targets en, so there is no (en, en) entry.
+    ("ko", "ko"):    "",
+    ("es", "es"):    "",
     # multi → any: use ko-specific prefs since 정목사 only appears in Korean speech.
     ("multi", "en"): "여러분 → everyone; 정목사 → Pastor Chung.",
     ("multi", "es"): "여러분 → todos; 정목사 → Pastor Chung.",
@@ -159,21 +171,59 @@ def build_prompt(source: str, target: str) -> str:
 
 # ── Web State ─────────────────────────────────────────────────────────────────
 
-_web_state = {"lines": [], "updated": 0}
+# Viewers poll /api/latest for the whole service, so the payload must stay
+# bounded: keep only a recent window of lines plus a cumulative counter, and
+# let clients track their position via the start/total indices in the response.
+_WEB_LINES_MAX = 300
+
+_web_state = {"lines": deque(maxlen=_WEB_LINES_MAX), "total": 0, "updated": 0}
 _web_lock = threading.Lock()
-_default_target_lang = "en"  # set in main() from the first --target; injected into HTML
+_default_target_lang = "en"  # set in main() from the first --target
+# Operator's current run, exposed read-only via GET /api/config so the viewer
+# UI can validate a visitor's saved language against what's actually running.
+_current_source = "ko"
+_current_targets: list[str] = []
+
+
+def _encode_web_state() -> bytes:
+    """Caller must hold _web_lock (except at import time)."""
+    lines = list(_web_state["lines"])
+    return json.dumps({
+        "lines": lines,
+        "start": _web_state["total"] - len(lines),
+        "total": _web_state["total"],
+        "updated": _web_state["updated"],
+    }).encode()
+
+
+# Pre-encoded /api/latest response, rebuilt once per appended line. Viewer
+# polls just grab these bytes instead of re-serializing the state under
+# _web_lock on every request, which would block the transcription/translation
+# threads pushing new lines.
+_web_json_cache = _encode_web_state()
 
 
 def _update_web_state(kind: str, lang: str, text: str):
     """kind='transcription' or 'translation', lang='en'/'ko'/'es'/…"""
+    global _web_json_cache
     with _web_lock:
         _web_state["lines"].append({"kind": kind, "lang": lang, "text": text})
+        _web_state["total"] += 1
         _web_state["updated"] = time.time()
+        _web_json_cache = _encode_web_state()
 
 
 def _get_web_state_json() -> bytes:
     with _web_lock:
-        return json.dumps(_web_state).encode()
+        return _web_json_cache
+
+
+def _get_config_json() -> bytes:
+    return json.dumps({
+        "source": _current_source,
+        "targets": _current_targets,
+        "default_target": _default_target_lang,
+    }).encode()
 
 
 def _push_to_web(kind: str, text: str, fallback_lang: str = "en"):
@@ -189,545 +239,55 @@ def _push_to_web(kind: str, text: str, fallback_lang: str = "en"):
         _update_web_state(kind, lang, raw_text.strip())
 
 
-# ── HTML Template ─────────────────────────────────────────────────────────────
-
-CAPTION_HTML = r"""<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-
-  html, body {
-    width: 100%;
-    height: 100%;
-    background: transparent;
-    overflow: hidden;
-  }
-
-  #container {
-    width: 100%;
-    height: 100%;
-    overflow-y: auto;
-    scroll-behavior: smooth;
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-  }
-
-  #container::-webkit-scrollbar {
-    display: none;
-  }
-
-  .multi-line-block {
-    animation: fadeIn 0.25s ease-out;
-    margin-bottom: 0.45em;
-    opacity: 0.45;
-    transition: opacity 0.4s ease;
-  }
-
-  .multi-line-block:last-child {
-    opacity: 1;
-  }
-
-  .lang-line {
-    display: block;
-    width: 100%;
-  }
-
-  .line-item {
-    animation: fadeIn 0.25s ease-out;
-    opacity: 0.45;
-    transition: opacity 0.4s ease;
-  }
-
-  .line-item:last-child {
-    opacity: 1;
-  }
-
-  .span-item {
-    /* paragraph mode */
-  }
-
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to   { opacity: 1; }
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
-  #waiting-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.82);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 18px;
-    z-index: 999;
-    transition: opacity 0.4s ease;
-  }
-
-  #waiting-overlay.hidden {
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  #waiting-overlay .spinner {
-    width: 36px;
-    height: 36px;
-    border: 3px solid rgba(255,255,255,0.15);
-    border-top-color: rgba(255,255,255,0.8);
-    border-radius: 50%;
-    animation: spin 1s linear infinite;
-  }
-
-  #waiting-overlay .msg {
-    color: rgba(255,255,255,0.85);
-    font-family: system-ui, sans-serif;
-    font-size: 18px;
-  }
-
-  #waiting-overlay .dismiss {
-    color: rgba(255,255,255,0.35);
-    font-family: system-ui, sans-serif;
-    font-size: 13px;
-    cursor: pointer;
-    border: 1px solid rgba(255,255,255,0.15);
-    padding: 6px 18px;
-    border-radius: 20px;
-    background: none;
-    transition: all 0.2s;
-  }
-
-  #waiting-overlay .dismiss:hover {
-    color: rgba(255,255,255,0.7);
-    border-color: rgba(255,255,255,0.35);
-  }
-
-  .back-to-live {
-    position: fixed;
-    bottom: 24px;
-    left: 50%;
-    transform: translateX(-50%) translateY(12px);
-    z-index: 500;
-    background: rgba(20,20,20,0.85);
-    color: rgba(255,255,255,0.92);
-    font-family: system-ui, sans-serif;
-    font-size: 14px;
-    border: 1px solid rgba(255,255,255,0.25);
-    border-radius: 20px;
-    padding: 8px 18px;
-    cursor: pointer;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s ease, transform 0.2s ease;
-  }
-
-  .back-to-live.visible {
-    opacity: 1;
-    pointer-events: auto;
-    transform: translateX(-50%) translateY(0);
-  }
-</style>
-</head><body>
-
-<div id="waiting-overlay">
-  <div class="spinner"></div>
-  <div class="msg">Waiting for transcription…</div>
-  <button class="dismiss" onclick="dismissOverlay()">Dismiss</button>
-</div>
-
-<div id="container">
-  <div id="lines"></div>
-</div>
-<button id="back-to-live" class="back-to-live">&#8595; Back to Live</button>
-
-<script>
-(function() {
-  const params = new URLSearchParams(window.location.search);
-
-  // Modes
-  const DEFAULT_TARGET_LANG = "__DEFAULT_TARGET_LANG__";
-  const mode = params.get('mode') || 'translation';
-  const display = params.get('display') || 'line';
-
-  // Multi-language support:
-  // ?langs=en,ko,es
-  // Each language renders on its own line inside the same caption block.
-  //
-  // Backwards compatibility:
-  // ?lang=en still works.
-  const langsParam = params.get('langs');
-  const singleLang = params.get('lang');
-
-  let langs = [];
-
-  if (langsParam) {
-    langs = langsParam
-      .split(',')
-      .map(x => x.trim())
-      .filter(Boolean);
-  } else if (singleLang) {
-    langs = [singleLang];
-  } else if (mode === 'translation') {
-    langs = [DEFAULT_TARGET_LANG];
-  }
-
-  const multiLangMode = langs.length > 1;
-
-  // Typography
-  const fontSize   = params.get('fontSize')   || '48';
-  const fontFamily = params.get('fontFamily') || 'system-ui, sans-serif';
-  const googleFont = params.get('googleFont');
-  const fontWeight = params.get('fontWeight') || 'normal';
-  const color      = params.get('color')      || 'white';
-  const lineSpacing = params.get('lineSpacing') || '1.4';
-  const textAlign  = params.get('textAlign')  || 'left';
-  const textShadow = params.get('textShadow') || 'none';
-
-  // Layout
-  const bgColor  = params.get('bgColor') || '#000';
-  const padding  = params.get('padding') || '20';
-
-  const maxLines = Math.min(
-    params.get('maxLines') ? parseInt(params.get('maxLines')) : 0,
-    200
-  );
-
-  // Load Google Font if specified
-  if (googleFont) {
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href =
-      'https://fonts.googleapis.com/css2?family='
-      + encodeURIComponent(googleFont)
-      + '&display=swap';
-
-    document.head.appendChild(link);
-  }
-
-  const container = document.getElementById('container');
-  const linesDiv  = document.getElementById('lines');
-  const overlay   = document.getElementById('waiting-overlay');
-  const backToLiveBtn = document.getElementById('back-to-live');
-
-  // Apply styles
-  document.body.style.background = bgColor;
-  container.style.padding = padding + 'px';
-
-  const resolvedFamily = googleFont
-    ? '"' + googleFont.replace(/\+/g, ' ') + '", ' + fontFamily
-    : fontFamily;
-
-  linesDiv.style.cssText = [
-    'font-size:'    + fontSize + 'px',
-    'font-family:'  + resolvedFamily,
-    'font-weight:'  + fontWeight,
-    'color:'        + color,
-    'line-height:'  + lineSpacing,
-    'text-align:'   + textAlign,
-    'text-shadow:'  + textShadow,
-    'white-space:pre-wrap'
-  ].join(';');
-
-  let lastCount = 0;
-  let lastUpdated = 0;
-
-  let overlayDismissed = false;
-  let hasReceivedData = false;
-
-  const DOM_CAP = 200;
-
-  // How far back a paused viewer can scroll before old lines age out.
-  // Only enforced while pinned to the live edge — see trimDom().
-  const HISTORY_MS = Math.max(1, parseInt(params.get('historyMinutes') || '3', 10)) * 60 * 1000;
-
-  const FAST_MS = 150;
-  const MAX_MS  = 1000;
-  const GROWTH  = 1.5;
-
-  let pollDelay = FAST_MS;
-
-  // Scroll state: whether the viewer is pinned to the live edge (auto-scrolling
-  // on new lines) or has been manually scrolled back to read history.
-  //
-  // Unpinning is driven by actual input gestures (wheel/touch), not by
-  // inspecting scroll position after the fact — during continuous caption
-  // updates the program scrolls to the bottom every ~150ms, so a purely
-  // scroll-position-based check can never find a large enough window to
-  // reliably tell "user scrolled away" from "program is still animating."
-  let pinnedToBottom = true;
-
-  function unpin() {
-    if (!pinnedToBottom) return;
-    pinnedToBottom = false;
-    backToLiveBtn.classList.add('visible');
-  }
-
-  container.addEventListener('wheel', unpin, { passive: true });
-  container.addEventListener('touchmove', unpin, { passive: true });
-
-  // Re-pin if the user scrolls (or is scrolled) back down to the live edge
-  // themselves, without needing to hit the button.
-  container.addEventListener('scroll', function() {
-    if (pinnedToBottom) return;
-    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    if (distanceFromBottom < 24) {
-      pinnedToBottom = true;
-      backToLiveBtn.classList.remove('visible');
-    }
-  });
-
-  backToLiveBtn.addEventListener('click', function() {
-    pinnedToBottom = true;
-    backToLiveBtn.classList.remove('visible');
-    // Instant, not smooth: during continuous caption updates the smooth
-    // scroll-behavior on #container would otherwise keep chasing a moving
-    // target (scrollHeight grows every ~150ms) and never visibly settle.
-    container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
-  });
-
-  // Multi-language grouping state
-  // Groups buffer lines until all expected langs arrive or a timeout fires,
-  // then render them in LANG_ORDER sequence.
-  const LANG_ORDER = ['ko', 'en', 'es'];  // fixed display order
-  const GROUP_WINDOW_MS = 6000;  // wait up to 6s for slow translations
-  const recentGroups = [];
-
-  function getExpectedLangs() {
-    // langs array holds the active target languages from URL params
-    return langs.length > 0
-      ? LANG_ORDER.filter(l => langs.includes(l))
-      : LANG_ORDER;
-  }
-
-  function flushGroup(group) {
-    if (group.flushed) return;
-    group.flushed = true;
-    clearTimeout(group.timer);
-    const ordered = getExpectedLangs();
-    ordered.forEach(lang => {
-      if (group.buffer[lang] !== undefined) {
-        const langLine = makeLangLine(lang, group.buffer[lang]);
-        group.el.appendChild(langLine);
-      }
-    });
-  }
-
-  function appendMultiLanguageLine(line) {
-    const now = Date.now();
-    const expected = getExpectedLangs();
-
-    // Find a non-flushed recent group that doesn't already have this lang
-    let group = null;
-    for (let i = recentGroups.length - 1; i >= 0; i--) {
-      const g = recentGroups[i];
-      if (!g.flushed && (now - g.ts) <= GROUP_WINDOW_MS && g.buffer[line.lang] === undefined) {
-        group = g;
-        break;
-      }
-    }
-
-    // Create new group if needed
-    if (!group) {
-      const wrapper = document.createElement('div');
-      wrapper.className = 'multi-line-block';
-      wrapper.dataset.ts = String(now);
-      linesDiv.appendChild(wrapper);
-      group = { ts: now, el: wrapper, buffer: {}, flushed: false, timer: null };
-      recentGroups.push(group);
-      while (recentGroups.length > 50) recentGroups.shift();
-    }
-
-    group.buffer[line.lang] = line.text;
-
-    // Flush immediately if all expected langs are present
-    const have = expected.filter(l => group.buffer[l] !== undefined);
-    if (have.length >= expected.length) {
-      flushGroup(group);
-      return;
-    }
-
-    // Otherwise set/reset a deadline timer so we don't wait forever
-    clearTimeout(group.timer);
-    group.timer = setTimeout(() => flushGroup(group), GROUP_WINDOW_MS);
-  }
-
-  window.dismissOverlay = function() {
-    overlayDismissed = true;
-    overlay.classList.add('hidden');
-  };
-
-  overlay.addEventListener('click', function(e) {
-    if (e.target === overlay) {
-      window.dismissOverlay();
-    }
-  });
-
-  function scrollToBottom() {
-    requestAnimationFrame(function() {
-      container.scrollTop = container.scrollHeight;
-    });
-  }
-
-  function langAllowed(lang) {
-    if (langs.length === 0) return true;
-    return langs.includes(lang);
-  }
-
-  function makeLangLine(lang, text) {
-    const div = document.createElement('div');
-    div.className = 'lang-line';
-    div.dataset.lang = lang;
-    div.textContent = text;
-    return div;
-  }
-
-  function appendSingleLine(text) {
-    const ts = String(Date.now());
-    if (display === 'paragraph') {
-      const span = document.createElement('span');
-      span.className = 'span-item';
-      span.dataset.ts = ts;
-      span.textContent = text + ' ';
-      linesDiv.appendChild(span);
-    } else {
-      const div = document.createElement('div');
-      div.className = 'line-item';
-      div.dataset.ts = ts;
-      div.textContent = text;
-      linesDiv.appendChild(div);
-    }
-  }
-
-  function trimDom() {
-    const selector = multiLangMode
-      ? '.multi-line-block'
-      : (display === 'paragraph' ? '.span-item' : '.line-item');
-
-    // Absolute ceiling regardless of scroll position — a pure memory safety
-    // valve for a viewer left scrolled away for a very long time. Set well
-    // above the normal soft cap so it never disrupts an ordinary
-    // scroll-back-through-history session.
-    const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
-    let items = linesDiv.querySelectorAll(selector);
-    let hardExcess = items.length - HARD_CAP;
-    for (let i = 0; i < hardExcess; i++) {
-      items[i].remove();
-    }
-
-    // Everything below only runs while pinned to the live edge, so we never
-    // yank content out from under someone who has scrolled back to read it.
-    if (!pinnedToBottom) return;
-
-    items = linesDiv.querySelectorAll(selector);
-    const limit = maxLines > 0 ? maxLines : DOM_CAP;
-    const toRemove = items.length - limit;
-    for (let i = 0; i < toRemove; i++) {
-      items[i].remove();
-    }
-
-    const cutoff = Date.now() - HISTORY_MS;
-    const remaining = linesDiv.querySelectorAll(selector);
-    for (const el of remaining) {
-      if (parseInt(el.dataset.ts, 10) < cutoff) {
-        el.remove();
-      } else {
-        break; // elements are appended in chronological order
-      }
-    }
-  }
-
-  async function poll() {
-    try {
-      const resp = await fetch('/api/latest');
-
-      if (!resp.ok) {
-        throw new Error('HTTP ' + resp.status);
-      }
-
-      const data = await resp.json();
-
-      pollDelay = FAST_MS;
-
-      if (data.updated === lastUpdated) {
-        return;
-      }
-
-      lastUpdated = data.updated;
-
-      const allLines = data.lines;
-      const newLines = allLines.slice(lastCount);
-
-      lastCount = allLines.length;
-
-      let appended = false;
-
-      for (const line of newLines) {
-        if (line.kind !== mode) continue;
-        if (!langAllowed(line.lang)) continue;
-
-        if (!overlayDismissed && !hasReceivedData) {
-          hasReceivedData = true;
-          window.dismissOverlay();
-        }
-
-        if (multiLangMode) {
-          appendMultiLanguageLine(line);
-        } else {
-          appendSingleLine(line.text);
-        }
-
-        appended = true;
-      }
-
-      trimDom();
-
-      if (appended && pinnedToBottom) {
-        scrollToBottom();
-      }
-
-    } catch (e) {
-      pollDelay = Math.min(pollDelay * GROWTH, MAX_MS);
-
-    } finally {
-      setTimeout(poll, pollDelay);
-    }
-  }
-
-  poll();
-})();
-</script>
-</body></html>
-"""
-
-
 # ── HTTP Server ───────────────────────────────────────────────────────────────
+#
+# The caption viewer's HTML/CSS/JS used to live inline here as a Python
+# triple-quoted string (CAPTION_HTML). It has been extracted to
+# static/viewer.html, static/viewer.css, and static/viewer.js so it can be
+# edited as ordinary web files — no Python knowledge required to work on the
+# frontend. _CaptionHandler below just serves those files plus two small JSON
+# endpoints; it does no HTML templating of its own anymore.
 
 
 class _CaptionHandler(http.server.BaseHTTPRequestHandler):
+    def _serve_static_file(self, filename: str, content_type: str):
+        """Serve a file from STATIC_DIR as-is. `filename` is always one of the
+        hardcoded literals below (never derived from the request path), so
+        there's no path-traversal surface to worry about here."""
+        path = os.path.join(STATIC_DIR, filename)
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_json(self, payload: bytes):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self):
         try:
             parsed = urlparse(self.path)
             if parsed.path == "/api/latest":
-                data = _get_web_state_json()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(data)
+                self._serve_json(_get_web_state_json())
+            elif parsed.path == "/api/config":
+                self._serve_json(_get_config_json())
             elif parsed.path == "/":
-                safe_lang = _default_target_lang if _default_target_lang in ("ko", "en", "es") else "en"
-                html = CAPTION_HTML.replace("__DEFAULT_TARGET_LANG__", safe_lang).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                self.wfile.write(html)
+                self._serve_static_file("viewer.html", "text/html; charset=utf-8")
+            elif parsed.path == "/viewer.css":
+                self._serve_static_file("viewer.css", "text/css; charset=utf-8")
+            elif parsed.path == "/viewer.js":
+                self._serve_static_file("viewer.js", "application/javascript; charset=utf-8")
             else:
                 self.send_error(404)
         except BrokenPipeError:
@@ -738,7 +298,9 @@ class _CaptionHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_caption_server(port: int):
-    server = http.server.HTTPServer(("", port), _CaptionHandler)
+    # Threading: every phone in the congregation polls continuously; with a
+    # single-threaded server one slow client stalls everyone else's captions.
+    server = http.server.ThreadingHTTPServer(("", port), _CaptionHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -747,10 +309,31 @@ def start_caption_server(port: int):
 # ── Cloudflare Tunnel ─────────────────────────────────────────────────────────
 
 
+def _resolve_cloudflared() -> str:
+    """Locate the cloudflared binary.
+
+    GUI-launched apps (e.g. the Automator control-panel app) inherit a minimal
+    PATH from launchd that omits Homebrew's bin directory, so a bare
+    "cloudflared" lookup raises FileNotFoundError even when it is installed. Fall
+    back to the common Homebrew install locations before giving up.
+    """
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"):
+        if os.path.exists(candidate):
+            return candidate
+    raise RuntimeError(
+        "cloudflared not found on PATH or in /opt/homebrew/bin, /usr/local/bin. "
+        "Install it (`brew install cloudflared`) or run with --no-tunnel."
+    )
+
+
 def start_cloudflare_tunnel(tunnel_name: str, port: int):
     """Launch cloudflared as a subprocess for a named tunnel."""
+    cloudflared = _resolve_cloudflared()
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "run", "--url", f"http://localhost:{port}", tunnel_name],
+        [cloudflared, "tunnel", "run", "--url", f"http://localhost:{port}", tunnel_name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -949,7 +532,12 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str,
 
 def _parse_and_validate_targets(source: str, target_arg: Optional[str]) -> list[str]:
     """Resolve --target against --source. Returns the validated target list in
-    the order specified by the user (first target becomes the web default)."""
+    the order specified by the user (first target becomes the web default).
+
+    A target may equal a source language when that source is bilingual (ko+en or
+    es+en): matching segments pass through untranslated, exactly as --source
+    multi already handles ko/en/es. --source en is pure English, so it can never
+    target en (English → English does nothing)."""
     ALL = {"ko", "en", "es"}
     DEFAULTS = {"ko": "en", "multi": "ko,en,es"}
 
@@ -959,17 +547,18 @@ def _parse_and_validate_targets(source: str, target_arg: Optional[str]) -> list[
         target_arg = DEFAULTS[source]
 
     targets = [t.strip() for t in target_arg.split(",") if t.strip()]
+    tset = set(targets)
 
     if source == "multi":
-        if set(targets) != ALL or len(targets) != 3:
+        if tset != ALL or len(targets) != 3:
             sys.exit("--source multi requires --target ko,en,es (all three)")
         return targets
 
-    allowed = ALL - {source}
-    if source in targets:
-        sys.exit(f"--target cannot include --source ({source})")
-    if not targets or not set(targets).issubset(allowed):
-        sys.exit(f"--target must be a non-empty subset of {sorted(allowed)}")
+    if not targets or not tset.issubset(ALL):
+        sys.exit(f"--target must be a non-empty subset of {sorted(ALL)}")
+    if source == "en" and "en" in tset:
+        sys.exit("--source en cannot target en (English → English does nothing); "
+                 "choose ko and/or es")
     return targets
 
 
@@ -1022,8 +611,10 @@ def main():
         outline_text = load_outline(args.outline)
         print(f"Loaded outline: {args.outline} ({len(outline_text)} chars)")
 
-    global _default_target_lang
+    global _default_target_lang, _current_source, _current_targets
     _default_target_lang = targets[0]
+    _current_source = args.source
+    _current_targets = targets
 
     load_dotenv(override=True)
     api_key = os.environ.get("SONIOX_API_KEY")
@@ -1033,6 +624,11 @@ def main():
     anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
     if anthropic_api_key is None:
         raise RuntimeError("Missing ANTHROPIC_API_KEY. Set it in .env or environment.")
+
+    # Optional model override from the environment (e.g. CLAUDE_MODEL in .env, loaded
+    # above). Falls back to the translation backend's DEFAULT_MODEL. Read here, after
+    # load_dotenv, so a value set only in .env is honored.
+    model = os.environ.get("CLAUDE_MODEL") or tl_mod.DEFAULT_MODEL
 
     if args.device is not None:
         device_index = args.device
@@ -1046,20 +642,54 @@ def main():
         start_caption_server(args.port)
         print(f"Web captions: http://localhost:{args.port}")
 
+    # The launcher starts control_server.py backgrounded (`… &`), which sets this
+    # process tree's SIGINT disposition to SIG_IGN; main.py inherits it through
+    # Popen. Without re-installing handlers, control_server's SIGINT-based stop is
+    # silently ignored — it then falls back to SIGTERM, whose default action kills
+    # this process WITHOUT running the finally below, orphaning the cloudflared
+    # tunnel (which keeps competing for the shared named tunnel and breaks routing
+    # for other devices). Re-installing a handler for both signals overrides the
+    # inherited SIG_IGN and routes either signal through the finally so the tunnel
+    # is always torn down. Installed before the tunnel starts so no signal can
+    # arrive with a tunnel up but no handler yet.
+    def _graceful_shutdown(signum, frame):
+        # One-shot: ignore further signals once teardown has begun. A second
+        # signal (e.g. control_server's SIGTERM fallback after its 5s SIGINT
+        # timeout) would otherwise raise inside the finally below and abort it
+        # before the tunnel is terminated.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+
     tunnel_proc = None
     if args.tunnel and not args.no_tunnel:
-        tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
-        print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
+        try:
+            tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
+            print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
+        except (RuntimeError, OSError) as e:
+            print(f"Warning: could not start Cloudflare tunnel: {e}\n"
+                  f"Continuing with local captions only at http://localhost:{args.port}.",
+                  file=sys.stderr)
 
     try:
         print(f"Translation mode: {args.source} → {', '.join(targets)}")
         run_session(api_key, device_index, anthropic_api_key,
                     source=args.source, targets=targets, outline=outline_text,
                     transcriber_cls=tx_mod.Transcriber, backend_cls=tl_mod.Backend,
-                    make_client_fn=tl_mod.make_client, model=tl_mod.DEFAULT_MODEL)
+                    make_client_fn=tl_mod.make_client, model=model)
     finally:
         if tunnel_proc:
             tunnel_proc.terminate()
+            # 3s keeps a normal stop inside control_server's 5s SIGINT window;
+            # kill() covers a cloudflared that ignores SIGTERM (the launcher's
+            # pkill backstop is also SIGTERM, so it couldn't reap that either).
+            try:
+                tunnel_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                tunnel_proc.kill()
 
 
 if __name__ == "__main__":

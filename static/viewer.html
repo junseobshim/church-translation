@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Translation</title>
+<link rel="stylesheet" href="/viewer.css">
+</head>
+<body>
+
+<!-- "Waiting for transcription…" indicator, shown until the first caption
+     line arrives. Hidden entirely (not just dismissed) when ?hideStatus=1
+     is set, e.g. for a ProPresenter web-fill overlay. -->
+<div id="waiting-overlay">
+  <div class="spinner"></div>
+  <div class="msg">Waiting for transcription…</div>
+  <button class="dismiss" onclick="window.dismissOverlay()">Dismiss</button>
+</div>
+
+<div id="container">
+  <div id="lines"></div>
+</div>
+<button id="back-to-live" class="back-to-live">&#8595; Back to Live</button>
+
+<!-- Settings entry point. Hidden when ?hideStatus=1. -->
+<button id="settings-trigger" class="settings-trigger" aria-label="Open settings">&#9881;</button>
+
+<div id="settings-panel" class="settings-panel hidden">
+  <div class="settings-panel-header">
+    <span>Settings</span>
+    <button id="settings-close" class="settings-close" aria-label="Close settings">&times;</button>
+  </div>
+
+  <label class="settings-row">
+    <span class="settings-label">View</span>
+    <select id="view-select"></select>
+  </label>
+
+  <label class="settings-row">
+    <span class="settings-label">Font</span>
+    <select id="font-family-select">
+      <option value="system-ui, sans-serif">System</option>
+      <option value="Georgia, serif">Georgia</option>
+      <option value="'Helvetica Neue', Arial, sans-serif">Helvetica</option>
+      <option value="'Courier New', monospace">Courier</option>
+      <option value="'Noto Sans KR', system-ui, sans-serif" data-google-font="Noto Sans KR">Noto Sans KR</option>
+    </select>
+  </label>
+
+  <div class="settings-row">
+    <span class="settings-label">Font size</span>
+    <div class="stepper">
+      <button id="font-decrease" class="stepper-btn" aria-label="Decrease font size">&minus;</button>
+      <span id="font-size-value" class="stepper-value">48px</span>
+      <button id="font-increase" class="stepper-btn" aria-label="Increase font size">+</button>
+    </div>
+  </div>
+
+  <div class="settings-row">
+    <span class="settings-label">Theme</span>
+    <div id="theme-toggle" class="theme-toggle" role="group" aria-label="Light or dark theme">
+      <button type="button" class="theme-toggle-option" data-theme-value="dark">Dark</button>
+      <button type="button" class="theme-toggle-option" data-theme-value="light">Light</button>
+    </div>
+  </div>
+</div>
+
+<script src="/viewer.js"></script>
+</body>
+</html>

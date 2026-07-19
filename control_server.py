@@ -32,7 +32,12 @@ _outline_temp: Optional[tempfile.NamedTemporaryFile] = None
 
 # Heartbeat — set to current time whenever /api/heartbeat is called.
 _last_heartbeat: float = 0.0
-_HEARTBEAT_TIMEOUT = 12  # seconds; browser pings every 4s
+# Crash backstop only (force-quit, power loss, tab discard) — intentional
+# closes are handled by the /api/goodbye beacon within seconds. Must sit well
+# above 60s: Chrome throttles hidden-tab timers to ~1/min after 5 minutes in
+# the background, so a backgrounded panel heartbeats that slowly.
+_HEARTBEAT_TIMEOUT = 90  # seconds; browser pings every 4s (~1/min when throttled)
+_GOODBYE_GRACE = 5  # seconds after /api/goodbye before shutdown; any heartbeat cancels
 
 # Reference to the HTTPServer so handlers can call server.shutdown()
 _http_server: Optional[http.server.HTTPServer] = None
@@ -193,6 +198,31 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         global _last_heartbeat
         _last_heartbeat = time.monotonic()
         self._json(200, {"ok": True})
+
+    # ── /api/goodbye ───────────────────────────────────────────────────────────
+    def _handle_goodbye(self):
+        """Explicit goodbye from the browser (pagehide beacon on tab close).
+
+        pagehide also fires on reload and navigation, so don't shut down
+        immediately: wait a grace period and cancel if a heartbeat arrives —
+        a reloaded page (or a second open tab) reconnects within seconds.
+        """
+        goodbye_time = time.monotonic()
+        self._json(200, {"ok": True})
+        print(f"[ControlServer] Goodbye received — shutting down in "
+              f"{_GOODBYE_GRACE}s unless the panel reconnects.")
+
+        def _pending_shutdown():
+            time.sleep(_GOODBYE_GRACE)
+            if _last_heartbeat > goodbye_time:
+                print("[ControlServer] Panel reconnected — shutdown canceled.")
+                return
+            print("[ControlServer] Browser closed. Shutting down.")
+            if _http_server:
+                _http_server.shutdown()
+
+        threading.Thread(target=_pending_shutdown, daemon=True).start()
+
     def _proxy_latest(self):
         """Proxy /api/latest to the caption server port."""
         import urllib.request
@@ -263,6 +293,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self._handle_stop()
             elif path == "/api/shutdown":
                 self._handle_shutdown()
+            elif path == "/api/goodbye":
+                self._handle_goodbye()
             else:
                 self.send_error(404)
         except BrokenPipeError:
@@ -284,10 +316,14 @@ def main():
     args = parser.parse_args()
 
     global _http_server
-    _http_server = http.server.HTTPServer(("", args.port), ControlHandler)
+    # ThreadingHTTPServer: requests are handled concurrently, so a slow
+    # /api/latest proxy or a blocking /api/stop can't queue heartbeats behind
+    # it and trip the liveness watchdog mid-session.
+    _http_server = http.server.ThreadingHTTPServer(("", args.port), ControlHandler)
     server = _http_server
 
-    # Start heartbeat watcher — shuts down if browser tab closes
+    # Heartbeat watcher — backstop that shuts down if the browser disappears
+    # without a goodbye (Chrome force-quit, power loss, tab discarded).
     global _last_heartbeat
     _last_heartbeat = time.monotonic()  # grace period from startup
 
@@ -297,7 +333,7 @@ def main():
         while True:
             time.sleep(3)
             if time.monotonic() - _last_heartbeat > _HEARTBEAT_TIMEOUT:
-                print("[ControlServer] Heartbeat timeout — browser tab closed. Shutting down.")
+                print("[ControlServer] Heartbeat timeout — browser gone without goodbye. Shutting down.")
                 srv.shutdown()  # unblocks serve_forever(); finally block cleans up
                 break
 
