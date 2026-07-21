@@ -13,6 +13,7 @@ Then open http://localhost:9090 in a browser.
 
 import json
 import os
+import shutil
 import sys
 import signal
 import subprocess
@@ -58,6 +59,79 @@ def get_audio_devices() -> List[Dict]:
         return [{"index": -1, "name": f"Error loading devices: {e}"}]
 
 
+def _tunnel_url_map() -> Dict[str, str]:
+    """Tunnel name → public URL, from tunnels.json. Empty if unreadable."""
+    path = Path(__file__).parent / "tunnels.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("tunnels", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def _local_tunnel_ids() -> set:
+    """Tunnel UUIDs this device holds credentials for.
+
+    A tunnel can only be *run* here if its <uuid>.json credentials file exists.
+    Note this is a convenience filter, not a security boundary: cert.pem lets
+    this device mint credentials for any tunnel on the account via
+    `cloudflared tunnel token --cred-file`.
+    """
+    ids = set()
+    for creds in Path.home().joinpath(".cloudflared").glob("*.json"):
+        try:
+            with open(creds, encoding="utf-8") as f:
+                tunnel_id = json.load(f).get("TunnelID")
+            if tunnel_id:
+                ids.add(tunnel_id)
+        except (OSError, ValueError):
+            continue
+    return ids
+
+
+def get_tunnels() -> List[Dict]:
+    """Named tunnels runnable on this device, each with its public URL.
+
+    `cloudflared tunnel list` is a network call against the Cloudflare API, so it
+    lists every tunnel on the account — including ones with no credentials here —
+    and fails outright when offline. Intersect with the on-disk credentials and
+    fall back to the tunnels.json mapping so the panel still offers choices when
+    the API is unreachable.
+    """
+    url_map = _tunnel_url_map()
+    cloudflared = shutil.which("cloudflared")
+    if not cloudflared:
+        # GUI launches inherit a launchd PATH without Homebrew (see main.py).
+        for candidate in ("/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"):
+            if os.path.exists(candidate):
+                cloudflared = candidate
+                break
+
+    if cloudflared:
+        try:
+            out = subprocess.run(
+                [cloudflared, "tunnel", "list", "--output", "json"],
+                capture_output=True, timeout=6, check=True,
+            ).stdout
+            local_ids = _local_tunnel_ids()
+            found = [
+                {"name": t["name"], "id": t["id"], "url": url_map.get(t["name"])}
+                for t in json.loads(out)
+                if t.get("id") in local_ids
+            ]
+            # Order by tunnels.json rather than the API's creation-date order, so
+            # the panel's default selection (first entry) is ours to control and
+            # can't silently change when a tunnel is added. Unmapped tunnels last.
+            order = list(url_map)
+            found.sort(key=lambda t: order.index(t["name"]) if t["name"] in order else len(order))
+            return found
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError):
+            pass
+
+    # Offline / cloudflared missing: names from the map, URLs included, no IDs.
+    return [{"name": name, "id": None, "url": url} for name, url in url_map.items()]
+
+
 def build_command(payload: dict, outline_path: Optional[str]) -> list[str]:
     # Use the venv Python explicitly so dependencies (sounddevice, etc.) are available
     venv_python = Path(__file__).parent / "venv" / "bin" / "python3"
@@ -68,8 +142,13 @@ def build_command(payload: dict, outline_path: Optional[str]) -> list[str]:
     if payload.get("device") is not None:
         cmd += ["--device", str(payload["device"])]
     cmd += ["--port", str(payload.get("port", 8080))]
-    if not payload.get("tunnel", True):
+    # `tunnel` is a tunnel name, or null/false for no tunnel. Older clients sent
+    # a bare boolean, where true meant main.py's default tunnel.
+    tunnel = payload.get("tunnel", True)
+    if not tunnel:
         cmd.append("--no-tunnel")
+    elif isinstance(tunnel, str):
+        cmd += ["--tunnel", tunnel]
     if outline_path:
         cmd += ["--outline", outline_path]
     return cmd
@@ -112,6 +191,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
     def _serve_devices(self):
         devices = get_audio_devices()
         self._json(200, devices)
+
+    # ── /api/tunnels ───────────────────────────────────────────────────────────
+    def _serve_tunnels(self):
+        self._json(200, get_tunnels())
 
     # ── /api/start ─────────────────────────────────────────────────────────────
     def _handle_start(self):
@@ -261,6 +344,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self._serve_ui()
             elif path == "/api/devices":
                 self._serve_devices()
+            elif path == "/api/tunnels":
+                self._serve_tunnels()
             elif path == "/api/status":
                 self._serve_status()
             elif path == "/api/latest":

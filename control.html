@@ -514,7 +514,7 @@
     margin: 18px 0;
   }
 
-  /* Toggle */
+  /* Setting rows */
   .toggle-row {
     display: flex;
     align-items: center;
@@ -530,47 +530,6 @@
     font-size: 12px;
     color: var(--muted);
     margin-top: 2px;
-  }
-
-  .toggle {
-    position: relative;
-    width: 44px;
-    height: 24px;
-    flex-shrink: 0;
-  }
-
-  .toggle input { opacity: 0; width: 0; height: 0; }
-
-  .toggle-slider {
-    position: absolute;
-    inset: 0;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-
-  .toggle-slider::before {
-    content: '';
-    position: absolute;
-    width: 16px;
-    height: 16px;
-    left: 3px;
-    top: 3px;
-    background: var(--muted);
-    border-radius: 50%;
-    transition: all 0.2s;
-  }
-
-  .toggle input:checked + .toggle-slider {
-    background: var(--green-dim);
-    border-color: var(--green);
-  }
-
-  .toggle input:checked + .toggle-slider::before {
-    transform: translateX(20px);
-    background: var(--green);
   }
 
   /* Port section */
@@ -767,15 +726,12 @@
     <div id="advancedBody" style="display:none">
       <div class="divider"></div>
 
-      <div class="toggle-row" style="margin-bottom:16px">
-        <div>
-          <div class="toggle-label">Cloudflare tunnel</div>
-          <div class="toggle-sub">Enables phone access via live.rctranslation.org</div>
-        </div>
-        <label class="toggle">
-          <input type="checkbox" id="tunnelToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
+      <div style="margin-bottom:16px">
+        <div class="toggle-label">Cloudflare tunnel</div>
+        <div class="toggle-sub" id="tunnelSub" style="margin-bottom:8px">Enables phone access</div>
+        <select class="device-select" id="tunnelSelect" style="width:100%">
+          <option value="">Loading…</option>
+        </select>
       </div>
 
       <div class="toggle-row" style="margin-bottom:16px">
@@ -945,6 +901,67 @@
   let lastLineCount = 0;
   let advancedOpen = false;
   let outlineTempPath = null;
+  let tunnels = [];  // [{name, id, url}] — tunnels runnable on this device
+
+  // ── Tunnel loading ─────────────────────────────────────────────────────────
+  // Empty select value means "no tunnel" (main.py --no-tunnel); any other value
+  // is a tunnel name passed through as --tunnel.
+  function selectedTunnel() {
+    return document.getElementById('tunnelSelect').value || null;
+  }
+
+  function selectedTunnelUrl() {
+    const name = selectedTunnel();
+    if (!name) return null;
+    const t = tunnels.find(t => t.name === name);
+    return t ? t.url : null;
+  }
+
+  async function loadTunnels() {
+    const sel = document.getElementById('tunnelSelect');
+    try {
+      const r = await fetch('/api/tunnels');
+      if (!r.ok) throw new Error();
+      tunnels = await r.json();
+    } catch(e) {
+      tunnels = [];
+    }
+    sel.innerHTML = '';
+    tunnels.forEach((t, i) => {
+      const opt = document.createElement('option');
+      opt.value = t.name;
+      // Surface the host, since which one is live vs. test is the whole point.
+      opt.textContent = t.url ? `${t.name} — ${t.url.replace(/^https:\/\//, '')}` : t.name;
+      if (i === 0) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = 'No tunnel — local network only';
+    if (!tunnels.length) none.selected = true;
+    sel.appendChild(none);
+    updateTunnelSub();
+    updateCmd();
+  }
+
+  function updateTunnelSub() {
+    const sub = document.getElementById('tunnelSub');
+    const url = selectedTunnelUrl();
+    if (!selectedTunnel()) {
+      sub.textContent = tunnels.length
+        ? 'Phones will not be able to connect'
+        : '⚠ No tunnels found on this device';
+    } else {
+      sub.textContent = url
+        ? `Enables phone access via ${url.replace(/^https:\/\//, '')}`
+        : '⚠ No public URL mapped for this tunnel (see tunnels.json)';
+    }
+  }
+
+  document.getElementById('tunnelSelect').addEventListener('change', function() {
+    updateTunnelSub();
+    updateCmd();
+  });
 
   // ── Device loading ─────────────────────────────────────────────────────────
   async function loadDevices() {
@@ -1058,7 +1075,7 @@
   // ── Command builder ────────────────────────────────────────────────────────
   function updateCmd() {
     const port = document.getElementById('portInput').value || '8080';
-    const tunnel = document.getElementById('tunnelToggle').checked;
+    const tunnel = selectedTunnel();
     const targetStr = [...targets].join(',');
     let cmd = `<span class="cmd-part">python</span> <span class="cmd-arg">main.py</span>`;
     cmd += ` --source ${source}`;
@@ -1066,12 +1083,12 @@
     if (deviceIndex) cmd += ` --device ${deviceIndex}`;
     cmd += ` --port ${port}`;
     if (!tunnel) cmd += ` --no-tunnel`;
+    else cmd += ` --tunnel ${tunnel}`;
     if (document.getElementById('outlineText').value.trim()) cmd += ` --outline &lt;outline.txt&gt;`;
     document.getElementById('cmdPreview').innerHTML = cmd;
   }
 
   document.getElementById('portInput').addEventListener('input', updateCmd);
-  document.getElementById('tunnelToggle').addEventListener('change', updateCmd);
   document.getElementById('outlineText').addEventListener('input', updateCmd);
 
   // ── Advanced toggle ────────────────────────────────────────────────────────
@@ -1157,9 +1174,8 @@
   // ── Build viewer links ─────────────────────────────────────────────────────
   function buildLinks() {
     const port = document.getElementById('portInput').value || '8080';
-    const tunnel = document.getElementById('tunnelToggle').checked;
+    const remoteBase = selectedTunnelUrl();
     const localBase = `http://localhost:${port}`;
-    const remoteBase = 'https://live.rctranslation.org';
     const links = [];
 
     [...targets].forEach(lang => {
@@ -1171,12 +1187,15 @@
         url: `${localBase}/?mode=translation&lang=${lang}&fontSize=72&padding=40`,
         sub: 'Open on TV browser',
       });
-      if (tunnel) {
+      // No remote link without a tunnel, or with one that has no mapped host —
+      // the URL would be a guess, and on the test tunnel a wrong guess would
+      // send the congregation to the live host.
+      if (remoteBase) {
         links.push({
           icon: '📱',
           name: `${langName} · Phones`,
           url: `${remoteBase}/?mode=translation&lang=${lang}&fontSize=28`,
-          sub: 'Share this link',
+          sub: remoteBase.replace(/^https:\/\//, ''),
         });
       }
     });
@@ -1229,7 +1248,7 @@
       targets: [...targets],
       device: parseInt(deviceIndex),
       port: parseInt(document.getElementById('portInput').value) || 8080,
-      tunnel: document.getElementById('tunnelToggle').checked,
+      tunnel: selectedTunnel(),
       outline: outline || null,
     };
 
@@ -1342,6 +1361,7 @@
 
   // ── Init ───────────────────────────────────────────────────────────────────
   loadDevices();
+  loadTunnels();
   updateCmd();
   setStatus('ready', 'Ready · select settings below');
 </script>

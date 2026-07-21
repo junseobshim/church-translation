@@ -347,6 +347,22 @@ def _resolve_cloudflared() -> str:
     )
 
 
+def tunnel_public_url(tunnel_name: str) -> Optional[str]:
+    """Public URL served by a named tunnel, or None if it has no mapping.
+
+    The name→URL mapping lives in tunnels.json rather than being hardcoded here
+    so main.py, control_server.py and the control panel can't disagree about
+    which host a tunnel fronts. An unmapped tunnel is not an error — it just
+    means we can't advertise a remote URL for it.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnels.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("tunnels", {}).get(tunnel_name)
+    except (OSError, ValueError):
+        return None
+
+
 def start_cloudflare_tunnel(tunnel_name: str, port: int):
     """Launch cloudflared as a subprocess for a named tunnel."""
     cloudflared = _resolve_cloudflared()
@@ -601,7 +617,8 @@ def main():
                         help="Web caption server port (default: 8080, 0 to disable)")
     parser.add_argument("--tunnel", type=str, default="church-live",
                         help="Cloudflare tunnel name (default: church-live). "
-                             "Use --no-tunnel to skip.")
+                             "Use church-testing to exercise the mirrored test "
+                             "stack without touching live. Use --no-tunnel to skip.")
     parser.add_argument("--no-tunnel", action="store_true",
                         help="Skip starting the Cloudflare tunnel.")
     parser.add_argument("--outline", type=str, default=None,
@@ -686,7 +703,9 @@ def main():
     if args.tunnel and not args.no_tunnel:
         try:
             tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
-            print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
+            public_url = tunnel_public_url(args.tunnel)
+            suffix = f" → {public_url}" if public_url else ""
+            print(f"Cloudflare tunnel '{args.tunnel}' started{suffix}")
         except (RuntimeError, OSError) as e:
             print(f"Warning: could not start Cloudflare tunnel: {e}\n"
                   f"Continuing with local captions only at http://localhost:{args.port}.",

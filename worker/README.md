@@ -4,14 +4,30 @@ Serves a "Waiting for transcription…" page on `https://live.rctranslation.org/
 
 Pass `?hideStatus=1` (e.g. for ProPresenter web fill) to swap the visible waiting page for a transparent silent-polling stub — same auto-reload behavior, no spinner painted on the projection during downtime.
 
-## Deploy (one-time)
+## Two environments
+
+There are two deployments of this Worker, differing only in name and hostname:
+
+| Config | Worker | Hostname | Tunnel |
+|--------|--------|----------|--------|
+| `wrangler.toml` | `church-waiting-room` | `live.rctranslation.org` | `church-live` |
+| `wrangler.test.toml` | `church-waiting-room-test` | `testing.rctranslation.org` | `church-testing` |
+
+**Testing is meant to be an exact mirror of live.** Both configs point at the same `src/index.js`, so the code cannot drift — but the deployments can, if one is pushed without the other.
+
+> **Any change affecting the live Worker must be reflected in the testing Worker.** Use `./deploy.sh` (deploys both) rather than a bare `wrangler deploy`. If you edit `wrangler.toml`, make the matching edit in `wrangler.test.toml`; if you add a Dashboard route for `live.rctranslation.org`, add the `testing.rctranslation.org` counterpart.
+
+## Deploy
 
 ```bash
 npm install -g wrangler
 wrangler login                # sign in to the same Cloudflare account that owns the tunnel
 cd worker
-wrangler deploy
+./deploy.sh                   # both environments
+./deploy.sh test              # testing only, while iterating on worker code
 ```
+
+`deploy.sh` pushes testing first, so a failing deploy leaves live untouched. There is deliberately no live-only mode — that's the direction that silently leaves testing stale.
 
 After deploy, nothing more to do — the Worker lives on Cloudflare's edge 24/7. Any device that runs `soniox_claude.py` (with the `cloudflared` tunnel credentials set up) will be detected as the origin automatically.
 
@@ -23,13 +39,18 @@ After deploy, nothing more to do — the Worker lives on Cloudflare's edge 24/7.
 2. Route: `live.rctranslation.org/api/*`
 3. Worker: **None** (leave unassigned / select "disable").
 4. Save.
+5. Repeat steps 1–4 for `testing.rctranslation.org/api/*` so the test host mirrors live.
 
-You should now have two routes on the zone:
+You should now have four routes on the zone:
 
 | Pattern | Worker |
 |---------|--------|
 | `live.rctranslation.org/*` | `church-waiting-room` |
 | `live.rctranslation.org/api/*` | None |
+| `testing.rctranslation.org/*` | `church-waiting-room-test` |
+| `testing.rctranslation.org/api/*` | None |
+
+The two `/*` routes come from the wrangler configs on deploy; the two `/api/*` exemptions must be added by hand.
 
 ### Why this is needed
 
@@ -51,4 +72,4 @@ For the first two, just repeat the four-step setup above (~30 seconds). For a po
 
 ## Updating the waiting page
 
-Edit `src/index.js`, then re-run `wrangler deploy`.
+Edit `src/index.js`, then run `./deploy.sh` to push both environments. To try a change on testing first, run `./deploy.sh test`, verify at `https://testing.rctranslation.org/`, then run `./deploy.sh` to promote it to live.
