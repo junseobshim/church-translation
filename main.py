@@ -203,24 +203,6 @@ def _encode_web_state() -> bytes:
 _web_json_cache = _encode_web_state()
 
 
-def _encode_web_state() -> bytes:
-    """Caller must hold _web_lock (except at import time)."""
-    lines = list(_web_state["lines"])
-    return json.dumps({
-        "lines": lines,
-        "start": _web_state["total"] - len(lines),
-        "total": _web_state["total"],
-        "updated": _web_state["updated"],
-    }).encode()
-
-
-# Pre-encoded /api/latest response, rebuilt once per appended line. Viewer
-# polls just grab these bytes instead of re-serializing the state under
-# _web_lock on every request, which would block the transcription/translation
-# threads pushing new lines.
-_web_json_cache = _encode_web_state()
-
-
 def _update_web_state(kind: str, lang: str, text: str):
     """kind='transcription' or 'translation', lang='en'/'ko'/'es'/…"""
     global _web_json_cache
@@ -484,7 +466,20 @@ class TranslationWorker:
                 src = self.inbox.get(timeout=0.25)
             except queue.Empty:
                 continue
-            clean_src = _LANG_TAG_RE.sub("", src).strip()
+            # Drain the whole backlog into one call. Phrases arrive about as
+            # fast as a single translation round-trip, so translating strictly
+            # one-per-call lets the queue (and the on-screen delay) grow
+            # without bound; coalescing keeps the delay at worst one in-flight
+            # call plus this one. When the worker is keeping up the queue is
+            # empty and this is a batch of one, identical to prior behavior.
+            batch = [src]
+            while True:
+                try:
+                    batch.append(self.inbox.get_nowait())
+                except queue.Empty:
+                    break
+            cleaned = (_LANG_TAG_RE.sub("", s).strip() for s in batch)
+            clean_src = " ".join(t for t in cleaned if t)
             if not clean_src:
                 continue
             combined = (self.pending_text + " " + clean_src).strip() if self.pending_text else clean_src
@@ -493,7 +488,13 @@ class TranslationWorker:
             except Exception as e:
                 print(f"[{self.backend.target} translation error: {e}]", file=sys.stderr)
                 self.backend.mark_activity()
+                # Keep the batch for the next call — dropping it would lose a
+                # whole backlog of speech on a transient API error.
+                self.pending_text = combined
                 continue
+            if len(batch) > 1:
+                print(f"[worker {self.backend.target}: coalesced={len(batch)}]",
+                      file=sys.stderr)
             if "[SKIP]" in out:
                 self.pending_text = combined
                 continue
