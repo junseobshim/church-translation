@@ -153,12 +153,18 @@ class Backend:
             messages.append({"role": "user", "content": s})
             messages.append({"role": "assistant", "content": t})
         messages.append({"role": "user", "content": latest})
+        # 4096 is a ceiling, not a target — costs nothing unless generated.
+        # Sized so a coalesced catch-up batch after a long stall (the worker
+        # drains its whole backlog into one call) still fits without truncation.
         resp = self.client.messages.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=4096,
             system=self.system,
             messages=messages,
         )
+        if resp.stop_reason == "max_tokens":
+            print(f"[{self.target} translation truncated at max_tokens]",
+                  file=sys.stderr)
         u = resp.usage
         cr = getattr(u, "cache_read_input_tokens", 0) or 0
         cw = getattr(u, "cache_creation_input_tokens", 0) or 0

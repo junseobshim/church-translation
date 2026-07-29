@@ -4,6 +4,9 @@ live-api-keys.txt
 
 # JSON credentials
 *.json
+# …except the tunnel→hostname map, which holds no secrets and must ship to every
+# volunteer machine or the control panel can't build phone links.
+!tunnels.json
 
 # Python
 __pycache__/

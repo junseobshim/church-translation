@@ -117,9 +117,18 @@ Alternatively, regenerate the credentials through the Cloudflare dashboard (Netw
 The tunnel starts automatically when you run the script — `--tunnel church-live` is the default. Pass `--no-tunnel` to skip it for local-only work:
 
 ```bash
-python main.py              # tunnel runs automatically
-python main.py --no-tunnel  # localhost only
+python main.py                        # live tunnel, runs automatically
+python main.py --tunnel church-testing  # testing mirror (see below)
+python main.py --no-tunnel            # localhost only
 ```
+
+In the control panel, the same choice is a dropdown under **Advanced options → Cloudflare tunnel**, listing the tunnels this device holds credentials for plus a "No tunnel" option. The phone links shown after Start follow the selected tunnel's hostname.
+
+### Testing tunnel
+
+`church-testing` → `testing.rctranslation.org` is a full mirror of the live stack (own tunnel, own Worker), for exercising Cloudflare and the public internet path without any risk of interfering with `live.rctranslation.org`. Use it for any rehearsal or debugging that would otherwise be done on live.
+
+The name→hostname mapping for both lives in [`tunnels.json`](tunnels.json), which the control panel, `main.py` and the control server all read. Add an entry there whenever you create a new tunnel, or the panel won't know what URL it serves. The **first** entry is the panel's default selection, so keep `church-live` at the top.
 
 Viewers can access:
 
@@ -136,14 +145,16 @@ When the tunnel has no origin (i.e. no device is running `main.py`), visitors to
 
 ### Troubleshooting: stale tunnels
 
-All devices share one named tunnel (`church-live`). Cloudflare treats multiple running `cloudflared` instances as replicas and load-balances across all of them, with **no awareness of which origin is actually serving captions**. So if a device leaves a `cloudflared` running after its caption server is gone, viewers of `live.rctranslation.org` hit that dead origin for a share of requests — the classic "captions only show up about half the time" symptom.
+All devices share one named tunnel per environment (`church-live` for live, `church-testing` for testing). Cloudflare treats multiple running `cloudflared` instances of the *same* tunnel as replicas and load-balances across all of them, with **no awareness of which origin is actually serving captions**. So if a device leaves a `cloudflared` running after its caption server is gone, viewers of `live.rctranslation.org` hit that dead origin for a share of requests — the classic "captions only show up about half the time" symptom.
 
 The control panel now prevents this on its own: it tears the tunnel down on every shutdown path, and clears a stale one on launch (see **Application** above). If you still suspect a leftover tunnel:
 
 ```bash
 pgrep -fa "cloudflared tunnel run"   # list tunnels running on THIS device
-pkill -f "cloudflared tunnel run"    # kill them
+pkill -f "cloudflared tunnel run"    # kill them (all tunnels, live and testing)
 ```
+
+Because a test session runs a *different* named tunnel, it can never steal live traffic — that isolation is the main reason the testing environment exists.
 
 This is **per-device** — it cannot clear a stale tunnel on a *different* machine. If another device is holding the shared tunnel, that machine must be cleaned (relaunch its control panel, which self-heals, or run `pkill` there). Making one device authoritative regardless of the others is a larger change (design sketches are kept locally in `docs/multi-device-streaming.md`, not committed).
 
@@ -171,6 +182,10 @@ Alternative backends drop in alongside without modifying the main file beyond ex
 - `Backend` with `from_outline(client, source, target, outline, model)` classmethod plus `warmup()`, `translate(context, latest)`, `mark_activity()`, and `start_keepalive(stop_event)` instance methods. Module-level `make_client(api_key)` factory and `DEFAULT_MODEL` constant.
 
 `websockets` is Soniox-only and `anthropic` is Claude-only at the import level — both are still required for the default Soniox + Claude path. Once optional backends ship, `requirements.txt` may split into extras keyed by backend.
+
+## Viewer settings panel
+
+The web display at `http://localhost:8080/` also ships a gear-icon settings panel (top right) for visitors who don't have a preset query-param link: a **View** dropdown (transcription or a specific target language), font family, font size, and a light/dark theme toggle. Choices persist per-browser via `localStorage` and don't affect the query-param links documented above, which still work unchanged and always take precedence — this is for the plain `http://localhost:8080/` / `live.rctranslation.org/` links people open directly. The panel and gear icon are hidden automatically whenever `hideStatus=1` is set, so ProPresenter web-fill links never show it.
 
 ## License
 

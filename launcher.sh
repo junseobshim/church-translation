@@ -46,8 +46,9 @@ cleanup() {
     # cloudflared holds no local listening port — it makes outbound-only
     # connections to Cloudflare's edge — so the port-based kills above never catch
     # it. Reap it by name so quitting the app mid-session doesn't leave the tunnel
-    # registered and competing for the shared named tunnel.
-    pkill -f "cloudflared tunnel run.*church-live" 2>/dev/null
+    # registered and competing for the shared named tunnel. Matches any tunnel,
+    # not just church-live, so test-tunnel sessions are reaped too.
+    pkill -f "cloudflared tunnel run" 2>/dev/null
 
     echo "[Launcher] Done."
 }
@@ -90,8 +91,9 @@ else
     # competing for the shared named tunnel. We are starting fresh — no control
     # server is running on this device — so any leftover cloudflared here is
     # stale. Clear it before we begin. (Guarded by the `else`: if a session were
-    # already live, we would not want to kill its tunnel.)
-    pkill -f "cloudflared tunnel run.*church-live" 2>/dev/null
+    # already live, we would not want to kill its tunnel.) Matches any tunnel so
+    # a stale test-tunnel session is cleared too.
+    pkill -f "cloudflared tunnel run" 2>/dev/null
 
     # Same for a stale main.py still holding the caption port — a new session
     # would otherwise fail to bind 8080 and die at Start.

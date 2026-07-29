@@ -1,0 +1,7 @@
+{
+  "_comment": "Maps a Cloudflare named tunnel to the public URL its hostname serves. Shared source of truth for main.py (startup banner), control_server.py (/api/tunnels) and the control panel (phone links). Add an entry here whenever you create a tunnel with `cloudflared tunnel route dns <tunnel> <hostname>`. Order matters: the control panel selects the FIRST entry by default, so keep the live tunnel at the top.",
+  "tunnels": {
+    "church-live": "https://live.rctranslation.org",
+    "church-testing": "https://testing.rctranslation.org"
+  }
+}

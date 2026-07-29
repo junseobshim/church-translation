@@ -1,0 +1,372 @@
+/* ── Reset & base ─────────────────────────────────────────────────────── */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+/* ── UI chrome colors ─────────────────────────────────────────────────── */
+/* The theme toggle in the settings panel controls the caption VIEW only —
+   the background/text color of the actual transcription/translation
+   stream being projected, set directly via JS (document.body.style.background
+   / linesDiv color — see applyTypography() in viewer.js), because it also
+   has to honor raw ?bgColor=/?color= URL overrides that don't map onto a
+   light/dark toggle. The settings panel, gear button, and back-to-live pill
+   are visitor controls, not part of the view itself — they intentionally
+   stay this one fixed dark style regardless of the chosen theme, rather
+   than following it. The waiting overlay is the one exception: it paints
+   directly over the caption view, so it does track the theme via
+   body[data-theme] — see the note above its rules below. */
+
+body {
+  --chrome-bg: rgba(20, 20, 20, 0.94);
+  --chrome-bg-solid: rgba(20, 20, 20, 0.85);
+  --chrome-fg: rgba(255, 255, 255, 0.92);
+  --chrome-fg-muted: rgba(255, 255, 255, 0.7);
+  --chrome-border: rgba(255, 255, 255, 0.2);
+  --chrome-field-bg: rgba(255, 255, 255, 0.08);
+  --chrome-field-bg-hover: rgba(255, 255, 255, 0.18);
+  --chrome-active-bg: rgba(255, 255, 255, 0.85);
+  --chrome-active-fg: #111;
+}
+
+/* ── Caption stream (ported from the original CAPTION_HTML, unchanged) ── */
+
+#container {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  /* No scroll-behavior: smooth — trimming old content shrinks scrollHeight
+     mid-animation and yanks the target around; line/multi modes get their
+     entrance smoothness from the fadeIn animation instead. */
+  /* mutateWithScrollAnchor compensates scrollTop manually when trims remove
+     content above a scrolled-back viewer (Safari has no native scroll
+     anchoring), so turn native anchoring off where it exists — otherwise
+     Chrome/Firefox adjust scrollTop too and every trim double-compensates. */
+  overflow-anchor: none;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+#container::-webkit-scrollbar {
+  display: none;
+}
+
+.multi-line-block {
+  animation: fadeIn 0.25s ease-out;
+  margin-bottom: 0.45em;
+}
+
+.lang-line {
+  display: block;
+  width: 100%;
+}
+
+.line-item {
+  animation: fadeIn 0.25s ease-out;
+}
+
+/* Paragraph-mode .span-item spans get no entrance animation: on large
+   30fps displays the fade-in reads as flicker, so new phrases appear
+   instantly. */
+.span-item {
+  /* paragraph mode */
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Waiting overlay ──────────────────────────────────────────────────── */
+/* Sits on top of the caption view, so unlike the rest of the chrome it
+   needs to track the theme setting (see applyTypography() in viewer.js,
+   which stamps body[data-theme]) — otherwise a dark tint over a light
+   theme's white background reads as a broken/black page. */
+
+#waiting-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.82);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  z-index: 999;
+  transition: opacity 0.4s ease;
+}
+
+body[data-theme="light"] #waiting-overlay {
+  background: rgba(255,255,255,0.9);
+}
+
+#waiting-overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ?hideStatus=1 — suppress the indicator entirely, no fade, no click
+   target, so nothing ever paints on a projection/web-fill overlay. */
+#waiting-overlay.force-hidden {
+  display: none;
+}
+
+#waiting-overlay .spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid rgba(255,255,255,0.15);
+  border-top-color: rgba(255,255,255,0.8);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+body[data-theme="light"] #waiting-overlay .spinner {
+  border-color: rgba(0,0,0,0.15);
+  border-top-color: rgba(0,0,0,0.8);
+}
+
+#waiting-overlay .msg {
+  color: rgba(255,255,255,0.85);
+  font-family: system-ui, sans-serif;
+  font-size: 18px;
+}
+
+body[data-theme="light"] #waiting-overlay .msg {
+  color: rgba(0,0,0,0.85);
+}
+
+#waiting-overlay .dismiss {
+  color: rgba(255,255,255,0.35);
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.15);
+  padding: 6px 18px;
+  border-radius: 20px;
+  background: none;
+  transition: all 0.2s;
+}
+
+#waiting-overlay .dismiss:hover {
+  color: rgba(255,255,255,0.7);
+  border-color: rgba(255,255,255,0.35);
+}
+
+body[data-theme="light"] #waiting-overlay .dismiss {
+  color: rgba(0,0,0,0.35);
+  border-color: rgba(0,0,0,0.15);
+}
+
+body[data-theme="light"] #waiting-overlay .dismiss:hover {
+  color: rgba(0,0,0,0.7);
+  border-color: rgba(0,0,0,0.35);
+}
+
+/* ── Back-to-live ─────────────────────────────────────────────────────── */
+
+.back-to-live {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(12px);
+  z-index: 500;
+  background: var(--chrome-bg-solid);
+  color: var(--chrome-fg);
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  border: 1px solid rgba(255,255,255,0.25);
+  border-radius: 20px;
+  padding: 8px 18px;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.back-to-live.visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ── Settings trigger (gear button) ──────────────────────────────────── */
+/* Fixed dark style regardless of the theme setting — see the note at the
+   top of this file. The theme toggle only re-colors the caption view. */
+
+.settings-trigger {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 600;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid var(--chrome-border);
+  background: var(--chrome-bg-solid);
+  color: var(--chrome-fg);
+  font-size: 18px;
+  cursor: pointer;
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.settings-trigger:hover {
+  background: var(--chrome-field-bg-hover);
+  transform: rotate(30deg);
+}
+
+.settings-trigger.hidden {
+  display: none;
+}
+
+/* ── Settings panel ───────────────────────────────────────────────────── */
+
+.settings-panel {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 700;
+  width: 288px;
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border);
+  border-radius: 12px;
+  padding: 16px;
+  font-family: system-ui, sans-serif;
+  color: var(--chrome-fg);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.settings-panel.hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-8px);
+}
+
+.settings-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.settings-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: none;
+  border: none;
+  color: var(--chrome-fg-muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  /* Negative margin keeps the header row's visual alignment tight while the
+     actual hit area (32px) extends past the glyph for an easier tap. */
+  margin: -6px -6px -6px 0;
+}
+
+.settings-close:hover {
+  color: var(--chrome-fg);
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.settings-row:last-child {
+  margin-bottom: 0;
+}
+
+.settings-label {
+  color: var(--chrome-fg-muted);
+  white-space: nowrap;
+}
+
+.settings-row select {
+  flex: 1;
+  min-width: 0;
+  min-height: 36px;
+  background: var(--chrome-field-bg);
+  color: inherit;
+  border: 1px solid var(--chrome-border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 13px;
+}
+
+.settings-row select:disabled {
+  opacity: 0.5;
+}
+
+/* ── Font size stepper ────────────────────────────────────────────────── */
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.stepper-btn {
+  /* 40px is a practical minimum comfortable tap target — up from the
+     original 26px, which was mouse-sized, not thumb-sized. */
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  border: 1px solid var(--chrome-border);
+  background: var(--chrome-field-bg);
+  color: var(--chrome-fg);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.stepper-btn:hover {
+  background: var(--chrome-field-bg-hover);
+}
+
+.stepper-value {
+  min-width: 40px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Theme toggle ─────────────────────────────────────────────────────── */
+
+.theme-toggle {
+  display: flex;
+  border: 1px solid var(--chrome-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.theme-toggle-option {
+  border: none;
+  background: transparent;
+  color: var(--chrome-fg-muted);
+  font-size: 12px;
+  min-height: 36px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+.theme-toggle-option.active {
+  background: var(--chrome-active-bg);
+  color: var(--chrome-active-fg);
+}

@@ -15,6 +15,9 @@ from collections import deque
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
+# Static frontend assets for the caption viewer (see _CaptionHandler below).
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
 # Suppress noisy thread exception tracebacks on Ctrl+C.
 threading.excepthook = lambda args: None
 
@@ -175,7 +178,11 @@ _WEB_LINES_MAX = 300
 
 _web_state = {"lines": deque(maxlen=_WEB_LINES_MAX), "total": 0, "updated": 0}
 _web_lock = threading.Lock()
-_default_target_lang = "en"  # set in main() from the first --target; injected into HTML
+_default_target_lang = "en"  # set in main() from the first --target
+# Operator's current run, exposed read-only via GET /api/config so the viewer
+# UI can validate a visitor's saved language against what's actually running.
+_current_source = "ko"
+_current_targets: list[str] = []
 
 
 def _encode_web_state() -> bytes:
@@ -211,6 +218,14 @@ def _get_web_state_json() -> bytes:
         return _web_json_cache
 
 
+def _get_config_json() -> bytes:
+    return json.dumps({
+        "source": _current_source,
+        "targets": _current_targets,
+        "default_target": _default_target_lang,
+    }).encode()
+
+
 def _push_to_web(kind: str, text: str, fallback_lang: str = "en"):
     """Parse [lang] prefix from text and push to web state."""
     m = re.match(r"\[([a-z]{2})\]\s*", text)
@@ -224,631 +239,55 @@ def _push_to_web(kind: str, text: str, fallback_lang: str = "en"):
         _update_web_state(kind, lang, raw_text.strip())
 
 
-# ── HTML Template ─────────────────────────────────────────────────────────────
-
-CAPTION_HTML = r"""<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-
-  html, body {
-    width: 100%;
-    height: 100%;
-    background: transparent;
-    overflow: hidden;
-  }
-
-  #container {
-    width: 100%;
-    height: 100%;
-    overflow-y: auto;
-    /* No scroll-behavior: smooth — trimming old content shrinks scrollHeight
-       mid-animation and yanks the target around; entrance smoothness comes
-       from the fadeIn animation instead. */
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-  }
-
-  #container::-webkit-scrollbar {
-    display: none;
-  }
-
-  .multi-line-block {
-    animation: fadeIn 0.25s ease-out;
-    margin-bottom: 0.45em;
-    opacity: 0.45;
-    transition: opacity 0.4s ease;
-  }
-
-  .multi-line-block:last-child {
-    opacity: 1;
-  }
-
-  .lang-line {
-    display: block;
-    width: 100%;
-  }
-
-  .line-item {
-    animation: fadeIn 0.25s ease-out;
-    opacity: 0.45;
-    transition: opacity 0.4s ease;
-  }
-
-  .line-item:last-child {
-    opacity: 1;
-  }
-
-  .span-item {
-    /* paragraph mode */
-    animation: fadeIn 0.25s ease-out;
-  }
-
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to   { opacity: 1; }
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
-  #waiting-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.82);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 18px;
-    z-index: 999;
-    transition: opacity 0.4s ease;
-  }
-
-  #waiting-overlay.hidden {
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  #waiting-overlay .spinner {
-    width: 36px;
-    height: 36px;
-    border: 3px solid rgba(255,255,255,0.15);
-    border-top-color: rgba(255,255,255,0.8);
-    border-radius: 50%;
-    animation: spin 1s linear infinite;
-  }
-
-  #waiting-overlay .msg {
-    color: rgba(255,255,255,0.85);
-    font-family: system-ui, sans-serif;
-    font-size: 18px;
-  }
-
-  #waiting-overlay .dismiss {
-    color: rgba(255,255,255,0.35);
-    font-family: system-ui, sans-serif;
-    font-size: 13px;
-    cursor: pointer;
-    border: 1px solid rgba(255,255,255,0.15);
-    padding: 6px 18px;
-    border-radius: 20px;
-    background: none;
-    transition: all 0.2s;
-  }
-
-  #waiting-overlay .dismiss:hover {
-    color: rgba(255,255,255,0.7);
-    border-color: rgba(255,255,255,0.35);
-  }
-
-  .back-to-live {
-    position: fixed;
-    bottom: 24px;
-    left: 50%;
-    transform: translateX(-50%) translateY(12px);
-    z-index: 500;
-    background: rgba(20,20,20,0.85);
-    color: rgba(255,255,255,0.92);
-    font-family: system-ui, sans-serif;
-    font-size: 14px;
-    border: 1px solid rgba(255,255,255,0.25);
-    border-radius: 20px;
-    padding: 8px 18px;
-    cursor: pointer;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s ease, transform 0.2s ease;
-  }
-
-  .back-to-live.visible {
-    opacity: 1;
-    pointer-events: auto;
-    transform: translateX(-50%) translateY(0);
-  }
-</style>
-</head><body>
-
-<div id="waiting-overlay">
-  <div class="spinner"></div>
-  <div class="msg">Waiting for transcription…</div>
-  <button class="dismiss" onclick="dismissOverlay()">Dismiss</button>
-</div>
-
-<div id="container">
-  <div id="lines"></div>
-</div>
-<button id="back-to-live" class="back-to-live">&#8595; Back to Live</button>
-
-<script>
-(function() {
-  const params = new URLSearchParams(window.location.search);
-
-  // Modes
-  const DEFAULT_TARGET_LANG = "__DEFAULT_TARGET_LANG__";
-  const mode = params.get('mode') || 'translation';
-  const display = params.get('display') || 'line';
-
-  // Multi-language support:
-  // ?langs=en,ko,es
-  // Each language renders on its own line inside the same caption block.
-  //
-  // Backwards compatibility:
-  // ?lang=en still works.
-  const langsParam = params.get('langs');
-  const singleLang = params.get('lang');
-
-  let langs = [];
-
-  if (langsParam) {
-    langs = langsParam
-      .split(',')
-      .map(x => x.trim())
-      .filter(Boolean);
-  } else if (singleLang) {
-    langs = [singleLang];
-  } else if (mode === 'translation') {
-    langs = [DEFAULT_TARGET_LANG];
-  }
-
-  const multiLangMode = langs.length > 1;
-
-  // Typography
-  const fontSize   = params.get('fontSize')   || '48';
-  const fontFamily = params.get('fontFamily') || 'system-ui, sans-serif';
-  const googleFont = params.get('googleFont');
-  const fontWeight = params.get('fontWeight') || 'normal';
-  const color      = params.get('color')      || 'white';
-  const lineSpacing = params.get('lineSpacing') || '1.4';
-  const textAlign  = params.get('textAlign')  || 'left';
-  const textShadow = params.get('textShadow') || 'none';
-
-  // Layout
-  const bgColor  = params.get('bgColor') || '#000';
-  const padding  = params.get('padding') || '20';
-
-  const maxLines = Math.min(
-    params.get('maxLines') ? parseInt(params.get('maxLines')) : 0,
-    200
-  );
-
-  // Load Google Font if specified
-  if (googleFont) {
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href =
-      'https://fonts.googleapis.com/css2?family='
-      + encodeURIComponent(googleFont)
-      + '&display=swap';
-
-    document.head.appendChild(link);
-  }
-
-  const container = document.getElementById('container');
-  const linesDiv  = document.getElementById('lines');
-  const overlay   = document.getElementById('waiting-overlay');
-  const backToLiveBtn = document.getElementById('back-to-live');
-
-  // Apply styles
-  document.body.style.background = bgColor;
-  container.style.padding = padding + 'px';
-
-  const resolvedFamily = googleFont
-    ? '"' + googleFont.replace(/\+/g, ' ') + '", ' + fontFamily
-    : fontFamily;
-
-  linesDiv.style.cssText = [
-    'font-size:'    + fontSize + 'px',
-    'font-family:'  + resolvedFamily,
-    'font-weight:'  + fontWeight,
-    'color:'        + color,
-    'line-height:'  + lineSpacing,
-    'text-align:'   + textAlign,
-    'text-shadow:'  + textShadow,
-    'white-space:pre-wrap'
-  ].join(';');
-
-  let lastCount = 0;
-  let lastUpdated = 0;
-
-  let overlayDismissed = false;
-  let hasReceivedData = false;
-
-  const DOM_CAP = 200;
-
-  // Paragraph mode groups spans into chunk <div>s of this many phrases. Each
-  // chunk wraps its text independently, so trimming whole old chunks never
-  // re-wraps ("respaces") the text still on screen — removing spans from the
-  // front of one flowing block would shift every wrap point after it.
-  const CHUNK_SPANS = 20;
-
-  // How far back a paused viewer can scroll before old lines age out.
-  // Only enforced while pinned to the live edge — see trimDom().
-  const HISTORY_MS = Math.max(1, parseInt(params.get('historyMinutes') || '3', 10)) * 60 * 1000;
-
-  // Phrases arrive every few seconds, so 300ms polling still feels instant;
-  // faster only multiplies load by every phone in the congregation.
-  const FAST_MS = 300;
-  const MAX_MS  = 1000;
-  const GROWTH  = 1.5;
-
-  let pollDelay = FAST_MS;
-
-  // Scroll state: whether the viewer is pinned to the live edge (auto-scrolling
-  // on new lines) or has been manually scrolled back to read history.
-  //
-  // Unpinning is driven by actual input gestures (wheel/touch), not by
-  // inspecting scroll position after the fact — during continuous caption
-  // updates the program scrolls to the bottom on every new line, so a purely
-  // scroll-position-based check can never find a large enough window to
-  // reliably tell "user scrolled away" from "program just scrolled."
-  let pinnedToBottom = true;
-
-  function unpin() {
-    if (!pinnedToBottom) return;
-    pinnedToBottom = false;
-    backToLiveBtn.classList.add('visible');
-  }
-
-  container.addEventListener('wheel', unpin, { passive: true });
-  container.addEventListener('touchmove', unpin, { passive: true });
-
-  // Re-pin if the user scrolls (or is scrolled) back down to the live edge
-  // themselves, without needing to hit the button.
-  container.addEventListener('scroll', function() {
-    if (pinnedToBottom) return;
-    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-    if (distanceFromBottom < 24) {
-      pinnedToBottom = true;
-      backToLiveBtn.classList.remove('visible');
-    }
-  });
-
-  backToLiveBtn.addEventListener('click', function() {
-    pinnedToBottom = true;
-    backToLiveBtn.classList.remove('visible');
-    container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
-  });
-
-  // Multi-language grouping state
-  // Groups buffer lines until all expected langs arrive or a timeout fires,
-  // then render them in LANG_ORDER sequence.
-  const LANG_ORDER = ['ko', 'en', 'es'];  // fixed display order
-  const GROUP_WINDOW_MS = 6000;  // wait up to 6s for slow translations
-  const recentGroups = [];
-
-  function getExpectedLangs() {
-    // langs array holds the active target languages from URL params
-    return langs.length > 0
-      ? LANG_ORDER.filter(l => langs.includes(l))
-      : LANG_ORDER;
-  }
-
-  function flushGroup(group) {
-    if (group.flushed) return;
-    group.flushed = true;
-    clearTimeout(group.timer);
-    const ordered = getExpectedLangs();
-    ordered.forEach(lang => {
-      if (group.buffer[lang] !== undefined) {
-        const langLine = makeLangLine(lang, group.buffer[lang]);
-        group.el.appendChild(langLine);
-      }
-    });
-  }
-
-  function appendMultiLanguageLine(line) {
-    const now = Date.now();
-    const expected = getExpectedLangs();
-
-    // Find a non-flushed recent group that doesn't already have this lang
-    let group = null;
-    for (let i = recentGroups.length - 1; i >= 0; i--) {
-      const g = recentGroups[i];
-      if (!g.flushed && (now - g.ts) <= GROUP_WINDOW_MS && g.buffer[line.lang] === undefined) {
-        group = g;
-        break;
-      }
-    }
-
-    // Create new group if needed
-    if (!group) {
-      const wrapper = document.createElement('div');
-      wrapper.className = 'multi-line-block';
-      wrapper.dataset.ts = String(now);
-      linesDiv.appendChild(wrapper);
-      group = { ts: now, el: wrapper, buffer: {}, flushed: false, timer: null };
-      recentGroups.push(group);
-      while (recentGroups.length > 50) recentGroups.shift();
-    }
-
-    group.buffer[line.lang] = line.text;
-
-    // Flush immediately if all expected langs are present
-    const have = expected.filter(l => group.buffer[l] !== undefined);
-    if (have.length >= expected.length) {
-      flushGroup(group);
-      return;
-    }
-
-    // Otherwise set/reset a deadline timer so we don't wait forever
-    clearTimeout(group.timer);
-    group.timer = setTimeout(() => flushGroup(group), GROUP_WINDOW_MS);
-  }
-
-  window.dismissOverlay = function() {
-    overlayDismissed = true;
-    overlay.classList.add('hidden');
-  };
-
-  overlay.addEventListener('click', function(e) {
-    if (e.target === overlay) {
-      window.dismissOverlay();
-    }
-  });
-
-  function scrollToBottom() {
-    requestAnimationFrame(function() {
-      container.scrollTop = container.scrollHeight;
-    });
-  }
-
-  function langAllowed(lang) {
-    if (langs.length === 0) return true;
-    return langs.includes(lang);
-  }
-
-  function makeLangLine(lang, text) {
-    const div = document.createElement('div');
-    div.className = 'lang-line';
-    div.dataset.lang = lang;
-    div.textContent = text;
-    return div;
-  }
-
-  function appendSingleLine(text) {
-    const ts = String(Date.now());
-    if (display === 'paragraph') {
-      const span = document.createElement('span');
-      span.className = 'span-item';
-      span.dataset.ts = ts;
-      span.textContent = text + ' ';
-      let chunk = linesDiv.lastElementChild;
-      if (!chunk || chunk.childElementCount >= CHUNK_SPANS) {
-        chunk = document.createElement('div');
-        chunk.className = 'para-chunk';
-        linesDiv.appendChild(chunk);
-      }
-      chunk.appendChild(span);
-      // Newest span's timestamp: the whole chunk ages out only once this
-      // is past the history cutoff (see trimParagraphChunks).
-      chunk.dataset.ts = ts;
-    } else {
-      const div = document.createElement('div');
-      div.className = 'line-item';
-      div.dataset.ts = ts;
-      div.textContent = text;
-      linesDiv.appendChild(div);
-    }
-  }
-
-  // Remove elements while keeping the viewport visually anchored: deleting
-  // content above the fold shifts everything up by its height, so shift a
-  // scrolled-back reader's scrollTop up by the same amount. While pinned the
-  // browser's own scrollTop clamping keeps the view glued to the live edge.
-  function removeWithScrollAnchor(els) {
-    if (els.length === 0) return;
-    if (pinnedToBottom) {
-      for (const el of els) el.remove();
-      return;
-    }
-    const before = container.scrollHeight;
-    for (const el of els) el.remove();
-    const delta = before - container.scrollHeight;
-    if (delta > 0) {
-      container.scrollTo({ top: Math.max(0, container.scrollTop - delta), behavior: 'instant' });
-    }
-  }
-
-  // Paragraph mode trims whole chunks only — dropping an entire chunk leaves
-  // the line-wrapping of every remaining chunk untouched, so text the viewer
-  // already read never re-wraps (see CHUNK_SPANS).
-  function trimParagraphChunks() {
-    const chunks = Array.from(linesDiv.children);
-    if (chunks.length <= 1) return; // never trim the chunk still being written
-    const sizes = chunks.map(c => c.childElementCount);
-    let total = sizes.reduce((a, b) => a + b, 0);
-
-    const toRemove = [];
-    let idx = 0;
-    const dropOldestWhile = cond => {
-      while (idx < chunks.length - 1 && cond(idx)) {
-        total -= sizes[idx];
-        toRemove.push(chunks[idx]);
-        idx++;
-      }
-    };
-
-    // Absolute ceiling regardless of scroll position — a pure memory safety
-    // valve for a viewer left scrolled away for a very long time.
-    const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
-    dropOldestWhile(() => total > HARD_CAP);
-
-    // Everything below only runs while pinned to the live edge, so we never
-    // yank content out from under someone who has scrolled back to read it.
-    if (pinnedToBottom) {
-      // Trim in batches: start only once well past the cap, then cut back to
-      // it, so trims happen once every several minutes instead of per poll.
-      const limit = maxLines > 0 ? maxLines : DOM_CAP;
-      if (total > limit * 1.5) dropOldestWhile(() => total > limit);
-
-      // Age-out on chunk boundaries: a chunk leaves only once its newest
-      // span is past the cutoff, so at least HISTORY_MS of history remains.
-      const cutoff = Date.now() - HISTORY_MS;
-      dropOldestWhile(i => parseInt(chunks[i].dataset.ts, 10) < cutoff);
-    }
-
-    removeWithScrollAnchor(toRemove);
-  }
-
-  function trimDom() {
-    if (!multiLangMode && display === 'paragraph') {
-      trimParagraphChunks();
-      return;
-    }
-
-    const selector = multiLangMode ? '.multi-line-block' : '.line-item';
-
-    // Absolute ceiling regardless of scroll position — a pure memory safety
-    // valve for a viewer left scrolled away for a very long time. Set well
-    // above the normal soft cap so it never disrupts an ordinary
-    // scroll-back-through-history session.
-    const HARD_CAP = Math.max(DOM_CAP, maxLines) * 5;
-    let items = linesDiv.querySelectorAll(selector);
-    if (items.length > HARD_CAP) {
-      removeWithScrollAnchor(Array.from(items).slice(0, items.length - HARD_CAP));
-    }
-
-    // Everything below only runs while pinned to the live edge, so we never
-    // yank content out from under someone who has scrolled back to read it.
-    if (!pinnedToBottom) return;
-
-    items = linesDiv.querySelectorAll(selector);
-    const limit = maxLines > 0 ? maxLines : DOM_CAP;
-    const toRemove = items.length - limit;
-    for (let i = 0; i < toRemove; i++) {
-      items[i].remove();
-    }
-
-    const cutoff = Date.now() - HISTORY_MS;
-    const remaining = linesDiv.querySelectorAll(selector);
-    for (const el of remaining) {
-      if (parseInt(el.dataset.ts, 10) < cutoff) {
-        el.remove();
-      } else {
-        break; // elements are appended in chronological order
-      }
-    }
-  }
-
-  async function poll() {
-    try {
-      const resp = await fetch('/api/latest');
-
-      if (!resp.ok) {
-        throw new Error('HTTP ' + resp.status);
-      }
-
-      const data = await resp.json();
-
-      pollDelay = FAST_MS;
-
-      if (data.updated === lastUpdated) {
-        return;
-      }
-
-      lastUpdated = data.updated;
-
-      // The server keeps only a recent window of lines: start is the absolute
-      // index of the window's first line, total counts every line ever pushed.
-      const start = data.start || 0;
-      const total = data.total || data.lines.length;
-      if (total < lastCount) {
-        // Server restarted mid-service — its counter is behind ours. Resync
-        // to the window start so the fresh backlog still renders.
-        lastCount = start;
-      }
-      const newLines = data.lines.slice(Math.max(0, lastCount - start));
-
-      lastCount = total;
-
-      let appended = false;
-
-      for (const line of newLines) {
-        if (line.kind !== mode) continue;
-        if (!langAllowed(line.lang)) continue;
-
-        if (!overlayDismissed && !hasReceivedData) {
-          hasReceivedData = true;
-          window.dismissOverlay();
-        }
-
-        if (multiLangMode) {
-          appendMultiLanguageLine(line);
-        } else {
-          appendSingleLine(line.text);
-        }
-
-        appended = true;
-      }
-
-      trimDom();
-
-      if (appended && pinnedToBottom) {
-        scrollToBottom();
-      }
-
-    } catch (e) {
-      pollDelay = Math.min(pollDelay * GROWTH, MAX_MS);
-
-    } finally {
-      setTimeout(poll, pollDelay);
-    }
-  }
-
-  poll();
-})();
-</script>
-</body></html>
-"""
-
-
 # ── HTTP Server ───────────────────────────────────────────────────────────────
+#
+# The caption viewer's HTML/CSS/JS used to live inline here as a Python
+# triple-quoted string (CAPTION_HTML). It has been extracted to
+# static/viewer.html, static/viewer.css, and static/viewer.js so it can be
+# edited as ordinary web files — no Python knowledge required to work on the
+# frontend. _CaptionHandler below just serves those files plus two small JSON
+# endpoints; it does no HTML templating of its own anymore.
 
 
 class _CaptionHandler(http.server.BaseHTTPRequestHandler):
+    def _serve_static_file(self, filename: str, content_type: str):
+        """Serve a file from STATIC_DIR as-is. `filename` is always one of the
+        hardcoded literals below (never derived from the request path), so
+        there's no path-traversal surface to worry about here."""
+        path = os.path.join(STATIC_DIR, filename)
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_json(self, payload: bytes):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self):
         try:
             parsed = urlparse(self.path)
             if parsed.path == "/api/latest":
-                data = _get_web_state_json()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(data)
+                self._serve_json(_get_web_state_json())
+            elif parsed.path == "/api/config":
+                self._serve_json(_get_config_json())
             elif parsed.path == "/":
-                safe_lang = _default_target_lang if _default_target_lang in ("ko", "en", "es") else "en"
-                html = CAPTION_HTML.replace("__DEFAULT_TARGET_LANG__", safe_lang).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                self.wfile.write(html)
+                self._serve_static_file("viewer.html", "text/html; charset=utf-8")
+            elif parsed.path == "/viewer.css":
+                self._serve_static_file("viewer.css", "text/css; charset=utf-8")
+            elif parsed.path == "/viewer.js":
+                self._serve_static_file("viewer.js", "application/javascript; charset=utf-8")
             else:
                 self.send_error(404)
         except BrokenPipeError:
@@ -888,6 +327,22 @@ def _resolve_cloudflared() -> str:
         "cloudflared not found on PATH or in /opt/homebrew/bin, /usr/local/bin. "
         "Install it (`brew install cloudflared`) or run with --no-tunnel."
     )
+
+
+def tunnel_public_url(tunnel_name: str) -> Optional[str]:
+    """Public URL served by a named tunnel, or None if it has no mapping.
+
+    The name→URL mapping lives in tunnels.json rather than being hardcoded here
+    so main.py, control_server.py and the control panel can't disagree about
+    which host a tunnel fronts. An unmapped tunnel is not an error — it just
+    means we can't advertise a remote URL for it.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnels.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("tunnels", {}).get(tunnel_name)
+    except (OSError, ValueError):
+        return None
 
 
 def start_cloudflare_tunnel(tunnel_name: str, port: int):
@@ -1011,7 +466,20 @@ class TranslationWorker:
                 src = self.inbox.get(timeout=0.25)
             except queue.Empty:
                 continue
-            clean_src = _LANG_TAG_RE.sub("", src).strip()
+            # Drain the whole backlog into one call. Phrases arrive about as
+            # fast as a single translation round-trip, so translating strictly
+            # one-per-call lets the queue (and the on-screen delay) grow
+            # without bound; coalescing keeps the delay at worst one in-flight
+            # call plus this one. When the worker is keeping up the queue is
+            # empty and this is a batch of one, identical to prior behavior.
+            batch = [src]
+            while True:
+                try:
+                    batch.append(self.inbox.get_nowait())
+                except queue.Empty:
+                    break
+            cleaned = (_LANG_TAG_RE.sub("", s).strip() for s in batch)
+            clean_src = " ".join(t for t in cleaned if t)
             if not clean_src:
                 continue
             combined = (self.pending_text + " " + clean_src).strip() if self.pending_text else clean_src
@@ -1020,7 +488,13 @@ class TranslationWorker:
             except Exception as e:
                 print(f"[{self.backend.target} translation error: {e}]", file=sys.stderr)
                 self.backend.mark_activity()
+                # Keep the batch for the next call — dropping it would lose a
+                # whole backlog of speech on a transient API error.
+                self.pending_text = combined
                 continue
+            if len(batch) > 1:
+                print(f"[worker {self.backend.target}: coalesced={len(batch)}]",
+                      file=sys.stderr)
             if "[SKIP]" in out:
                 self.pending_text = combined
                 continue
@@ -1144,7 +618,8 @@ def main():
                         help="Web caption server port (default: 8080, 0 to disable)")
     parser.add_argument("--tunnel", type=str, default="church-live",
                         help="Cloudflare tunnel name (default: church-live). "
-                             "Use --no-tunnel to skip.")
+                             "Use church-testing to exercise the mirrored test "
+                             "stack without touching live. Use --no-tunnel to skip.")
     parser.add_argument("--no-tunnel", action="store_true",
                         help="Skip starting the Cloudflare tunnel.")
     parser.add_argument("--outline", type=str, default=None,
@@ -1172,8 +647,10 @@ def main():
         outline_text = load_outline(args.outline)
         print(f"Loaded outline: {args.outline} ({len(outline_text)} chars)")
 
-    global _default_target_lang
+    global _default_target_lang, _current_source, _current_targets
     _default_target_lang = targets[0]
+    _current_source = args.source
+    _current_targets = targets
 
     load_dotenv(override=True)
     api_key = os.environ.get("SONIOX_API_KEY")
@@ -1227,7 +704,9 @@ def main():
     if args.tunnel and not args.no_tunnel:
         try:
             tunnel_proc = start_cloudflare_tunnel(args.tunnel, args.port)
-            print(f"Cloudflare tunnel '{args.tunnel}' started → https://live.rctranslation.org")
+            public_url = tunnel_public_url(args.tunnel)
+            suffix = f" → {public_url}" if public_url else ""
+            print(f"Cloudflare tunnel '{args.tunnel}' started{suffix}")
         except (RuntimeError, OSError) as e:
             print(f"Warning: could not start Cloudflare tunnel: {e}\n"
                   f"Continuing with local captions only at http://localhost:{args.port}.",

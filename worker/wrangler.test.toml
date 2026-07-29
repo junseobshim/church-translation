@@ -1,0 +1,24 @@
+# Testing mirror of wrangler.toml — same src/index.js, different name + hostname.
+# Deploy both together with ./deploy.sh so the two never drift apart.
+name = "church-waiting-room-test"
+main = "src/index.js"
+compatibility_date = "2026-04-21"
+
+[[routes]]
+pattern = "testing.rctranslation.org/*"
+zone_name = "rctranslation.org"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
