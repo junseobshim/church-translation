@@ -76,6 +76,10 @@ Open in any browser or ProPresenter Web Fill:
 
 
 
+### Scroll-back
+
+Any caption viewer supports scrolling up to read previous captions during a live service. Scrolling up detaches the view from auto-follow; a **Back to Live** button appears and snaps back to the current caption when clicked. Caption history is preserved for the last 3 minutes by default (configurable via `?historyMinutes=`), and old lines age out of the DOM automatically — but only while pinned to the live edge, so a viewer scrolled back to read history never has content pruned out from under them.
+
 ### Query Parameters
 
 
@@ -83,6 +87,7 @@ Open in any browser or ProPresenter Web Fill:
 | ------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `mode`        | `transcription`                                                         | `transcription` or `translation`                                                                                                                                                      |
 | `lang`        | first `--target` for translation mode; no filter for transcription mode | ISO 639-1 language filter. In transcription mode, omitting `lang` shows all languages as spoken; in translation mode it defaults to the first `--target`. Explicit value always wins. |
+| `langs`       | —                                                                       | Legacy multi-language column view (e.g. `?langs=ko,en,es`). Shows each language in its own column in fixed order (ko → en → es). The View dropdown is disabled when this param is active. |
 | `display`     | `line`                                                                  | `line` (block divs) or `paragraph` (inline spans)                                                                                                                                     |
 | `fontSize`    | `48`                                                                    | Font size in px                                                                                                                                                                       |
 | `fontFamily`  | `system-ui, sans-serif`                                                 | CSS font stack                                                                                                                                                                        |
@@ -96,6 +101,7 @@ Open in any browser or ProPresenter Web Fill:
 | `hideStatus`  | `0`                                                                     | Set to `1` to suppress the bottom-right "Waiting for transcription…" connection indicator. Use for ProPresenter web fill so the indicator never paints on the projection.             |
 | `padding`     | `20`                                                                    | Container padding in px                                                                                                                                                               |
 | `maxLines`    | `0` (unlimited)                                                         | Max lines displayed (hard cap 200)                                                                                                                                                    |
+| `historyMinutes` | `3`                                                                  | How many minutes of caption history to preserve for scroll-back. Minimum 1. Old lines age out automatically while pinned to the live edge.                                            |
 
 
 
@@ -156,7 +162,7 @@ pkill -f "cloudflared tunnel run"    # kill them (all tunnels, live and testing)
 
 Because a test session runs a *different* named tunnel, it can never steal live traffic — that isolation is the main reason the testing environment exists.
 
-This is **per-device** — it cannot clear a stale tunnel on a *different* machine. If another device is holding the shared tunnel, that machine must be cleaned (relaunch its control panel, which self-heals, or run `pkill` there). Making one device authoritative regardless of the others is a larger change (design sketches are kept locally in `docs/multi-device-streaming.md`, not committed).
+This is **per-device** — it cannot clear a stale tunnel on a *different* machine. If another device is holding the shared tunnel, that machine must be cleaned (relaunch its control panel, which self-heals, or run `pkill` there). Making one device authoritative regardless of the others is a larger change (design sketches are in `docs/multi-device-streaming.md`).
 
 ## CLI Options
 
