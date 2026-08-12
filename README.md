@@ -1,5 +1,7 @@
 # Live Church Sermon Translation
 
+_Last updated: August 3, 2026_
+
 Real-time sermon translation using [Soniox](https://soniox.com/) real-time STT and [Claude](https://anthropic.com/) for translation, with a built-in web display for ProPresenter or any browser. Supports Korean, English, and Spanish — in any source/target combination, including multilingual (ko+en+es) sermons. Each translation target runs on its own parallel worker, so one Korean phrase can be translated into English and Spanish simultaneously on separate URLs.
 
 ## Prerequisites
@@ -33,42 +35,7 @@ cp .env.example .env   # then edit .env and fill in SONIOX_API_KEY and ANTHROPIC
 
 ## Running
 
-```bash
-# Korean (mixed with English) → English  (default)
-python main.py
-
-# English → Korean
-python main.py --source en --target ko
-
-# Korean → English AND Spanish (parallel translation streams on separate URLs)
-python main.py --source ko --target en,es
-
-# Spanish (mixed with English) → English
-python main.py --source es --target en
-
-# Multilingual (ko + en + es speech) → all three translation streams
-python main.py --source multi
-```
-
-You'll be prompted to select an audio input device, then transcription and translation begin immediately. A web caption server starts on port 8080 by default.
-
-`--source` picks Soniox's strict language hints: `ko` → `[ko, en]`, `en` → `[en]`, `es` → `[es, en]`, `multi` → `[ko, en, es]`. `--target` accepts a comma-separated subset of `{ko, en, es}` minus the source; `--source multi` is fixed at `--target ko,en,es`. `--target` is required for `--source en` and `--source es`; defaults exist only for `ko` (→ `en`) and `multi` (→ `ko,en,es`).
-
-### Sermon Outline (optional)
-
-If you have the sermon outline ahead of time, pass it with `--outline` to give Claude topical and structural context. This also activates Anthropic prompt caching, making every subsequent translation call cheaper and slightly faster.
-
-```bash
-python main.py --outline path/to/sermon.txt
-```
-
-- On the command line, `--outline` takes a **UTF-8 plain-text** file. (The control panel additionally accepts a Word `.docx` upload, which it converts to text in the browser before sending — so `.docx` works from the panel, not from the `--outline` flag.) Any `.txt` with bullet points, verse references, or prose works. For a multilingual sermon, use a single multilingual outline; it is attached verbatim to every target worker's system prompt.
-- Caching activates only when the combined system prompt + outline exceeds 1024 tokens (roughly 700–800 words). Below that, the script warns on stderr and runs without caching.
-- With multiple `--target` languages, each target worker caches its own system-prompt + outline independently and has its own keep-alive ping. Expect one `Cache warmed` message per cached worker at startup.
-- The cache has a 5-minute lifetime between calls. A keep-alive ping fires every 4m30s of silence so the cache survives long pauses.
-- The outline is used as **context only** — Claude is instructed to translate what is actually said, even when the speaker rhetorically diverges from the outline.
-
-
+The recommended way to run this is via the control panel — see **Application** below. For direct CLI usage (`python main.py` with flags), see [CLI.md](CLI.md).
 
 ### Application
 
@@ -111,6 +78,10 @@ Open in any browser or ProPresenter Web Fill:
 
 
 
+### Scroll-back
+
+Any caption viewer supports scrolling up to read previous captions during a live service. Scrolling up detaches the view from auto-follow; a **Back to Live** button appears and snaps back to the current caption when clicked. Caption history is preserved for the last 3 minutes by default (configurable via `?historyMinutes=`), and old lines age out of the DOM automatically — but only while pinned to the live edge, so a viewer scrolled back to read history never has content pruned out from under them.
+
 ### Query Parameters
 
 
@@ -118,6 +89,7 @@ Open in any browser or ProPresenter Web Fill:
 | ------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `mode`        | `transcription`                                                         | `transcription` or `translation`                                                                                                                                                      |
 | `lang`        | first `--target` for translation mode; no filter for transcription mode | ISO 639-1 language filter. In transcription mode, omitting `lang` shows all languages as spoken; in translation mode it defaults to the first `--target`. Explicit value always wins. |
+| `langs`       | —                                                                       | Legacy multi-language column view (e.g. `?langs=ko,en,es`). Shows each language in its own column in fixed order (ko → en → es). The View dropdown is disabled when this param is active. |
 | `display`     | `line`                                                                  | `line` (block divs) or `paragraph` (inline spans)                                                                                                                                     |
 | `fontSize`    | `48`                                                                    | Font size in px                                                                                                                                                                       |
 | `fontFamily`  | `system-ui, sans-serif`                                                 | CSS font stack                                                                                                                                                                        |
@@ -131,6 +103,7 @@ Open in any browser or ProPresenter Web Fill:
 | `hideStatus`  | `0`                                                                     | Set to `1` to suppress the bottom-right "Waiting for transcription…" connection indicator. Use for ProPresenter web fill so the indicator never paints on the projection.             |
 | `padding`     | `20`                                                                    | Container padding in px                                                                                                                                                               |
 | `maxLines`    | `0` (unlimited)                                                         | Max lines displayed (hard cap 200)                                                                                                                                                    |
+| `historyMinutes` | `3`                                                                  | How many minutes of caption history to preserve for scroll-back. Minimum 1. Old lines age out automatically while pinned to the live edge.                                            |
 
 
 
@@ -191,22 +164,11 @@ pkill -f "cloudflared tunnel run"    # kill them (all tunnels, live and testing)
 
 Because a test session runs a *different* named tunnel, it can never steal live traffic — that isolation is the main reason the testing environment exists.
 
-This is **per-device** — it cannot clear a stale tunnel on a *different* machine. If another device is holding the shared tunnel, that machine must be cleaned (relaunch its control panel, which self-heals, or run `pkill` there). Making one device authoritative regardless of the others is a larger change (design sketches are kept locally in `docs/multi-device-streaming.md`, not committed).
+This is **per-device** — it cannot clear a stale tunnel on a *different* machine. If another device is holding the shared tunnel, that machine must be cleaned (relaunch its control panel, which self-heals, or run `pkill` there). Making one device authoritative regardless of the others is a larger change (design sketches are in `docs/multi-device-streaming.md`).
 
 ## CLI Options
 
-
-| Flag                        | Default                                                                       | Description                                                                                                                                                                                                 |
-| --------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--source {ko,en,es,multi}` | `ko`                                                                          | Source language. `ko` = Korean + English, `en` = English only, `es` = Spanish + English, `multi` = Korean + English + Spanish. Sets Soniox's strict language hints.                                         |
-| `--target CSV`              | `en` when `--source ko`, `ko,en,es` when `--source multi`; required otherwise | Comma-separated translation targets. Must be a non-empty subset of `{ko,en,es}` excluding `--source`. For `--source multi`, must be exactly `ko,en,es`. Each target runs as its own parallel Claude worker. |
-| `--device N`                | (interactive)                                                                 | Audio input device index (skip selection prompt)                                                                                                                                                            |
-| `--port PORT`               | `8080`                                                                        | Web caption server port (`0` to disable)                                                                                                                                                                    |
-| `--tunnel NAME`             | `church-live`                                                                 | Cloudflare tunnel name to start                                                                                                                                                                             |
-| `--no-tunnel`               | —                                                                             | Skip starting the Cloudflare tunnel                                                                                                                                                                         |
-| `--outline PATH`            | —                                                                             | Path to a UTF-8 `.txt` sermon outline. Enables per-target prompt caching when the combined system prompt exceeds 1024 tokens.                                                                               |
-| `--transcriber {soniox}`    | `soniox`                                                                      | Transcription backend. Loads `transcribe_<name>.py` at startup. More options will be added as alternative backends land (e.g. `mlx-whisper`, `azure`).                                                      |
-| `--translator {claude}`     | `claude`                                                                      | Translation backend. Loads `translate_<name>.py` at startup. More options will be added as alternative backends land (e.g. `qwen-mlx`, `gemini`).                                                           |
+See [CLI.md](CLI.md) for the full flag reference.
 
 
 
