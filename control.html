@@ -290,6 +290,11 @@
     background: var(--muted);
     flex-shrink: 0;
     transition: background 0.3s;
+    /* Line up with the status text rather than centring on the whole bar,
+       which drifts into the gap once the hint adds a second line.
+       (18px line box - 8px dot) / 2. */
+    align-self: flex-start;
+    margin-top: 5px;
   }
 
   .status-dot.ready { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
@@ -301,10 +306,28 @@
     50% { opacity: 0.4; }
   }
 
-  .status-text {
+  .status-main {
     flex: 1;
+    min-width: 0;          /* let long status text wrap instead of pushing the timer out */
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .status-text {
     color: var(--muted);
   }
+
+  /* Second status line, shown only after a session has been stopped. Closing
+     the tab is what triggers the server teardown, and with no stop button on
+     the panel there is otherwise nothing telling the operator to do it. */
+  .status-hint {
+    font-size: 12px;
+    color: var(--muted);
+    opacity: 0.75;
+  }
+
+  .status-hint:empty { display: none; }
 
   .status-text.running { color: var(--green); }
   .status-text.error { color: var(--red); }
@@ -560,71 +583,6 @@
     display: none;
   }
 
-  .btn-shutdown {
-    width: 100%;
-    max-width: 560px;
-    padding: 14px;
-    border-radius: 16px;
-    font-size: 14px;
-    font-weight: 500;
-    font-family: 'DM Sans', sans-serif;
-    cursor: pointer;
-    border: 1px solid rgba(247,95,95,0.2);
-    background: transparent;
-    color: var(--muted);
-    transition: all 0.2s ease;
-    letter-spacing: -0.1px;
-    display: none;
-  }
-
-  .btn-shutdown:hover {
-    background: var(--red-dim);
-    color: var(--red);
-    border-color: rgba(247,95,95,0.4);
-  }
-
-  /* Shutdown confirm dialog */
-  .shutdown-dialog {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.7);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    display: none;
-  }
-
-  .shutdown-dialog-box {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 32px;
-    max-width: 360px;
-    width: 90%;
-    text-align: center;
-  }
-
-  .shutdown-dialog-box .icon { font-size: 32px; margin-bottom: 12px; }
-  .shutdown-dialog-box h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
-  .shutdown-dialog-box p { font-size: 14px; color: var(--muted); margin-bottom: 24px; line-height: 1.5; }
-
-  .shutdown-dialog-btns { display: flex; gap: 10px; }
-  .shutdown-dialog-btns button {
-    flex: 1;
-    padding: 12px;
-    border-radius: 12px;
-    font-size: 14px;
-    font-weight: 500;
-    font-family: 'DM Sans', sans-serif;
-    cursor: pointer;
-    border: none;
-    transition: all 0.15s;
-  }
-  .btn-cancel-shutdown { background: var(--surface2); color: var(--text); }
-  .btn-cancel-shutdown:hover { background: #232830; }
-  .btn-confirm-shutdown { background: var(--red); color: #fff; }
-  .btn-confirm-shutdown:hover { background: #f96f6f; }
 </style>
 </head>
 <body>
@@ -640,7 +598,10 @@
   <!-- Status -->
   <div class="status-bar" id="statusBar">
     <div class="status-dot" id="statusDot"></div>
-    <span class="status-text" id="statusText">Select settings below to get started</span>
+    <div class="status-main">
+      <span class="status-text" id="statusText">Select settings below to get started</span>
+      <span class="status-hint" id="statusHint"></span>
+    </div>
     <span class="status-time" id="statusTime">00:00</span>
   </div>
 
@@ -655,9 +616,6 @@
         <option value="">Loading devices…</option>
       </select>
       <button class="device-refresh" onclick="loadDevices()" title="Refresh devices">↺</button>
-    </div>
-    <div style="margin-top:10px;font-size:12px;color:var(--muted)">
-      Select the microphone or audio input device to use.
     </div>
   </div>
 
@@ -794,24 +752,6 @@
     <div class="links-row" id="linksRow"></div>
   </div>
 
-  <!-- Stop Server button (always visible after first start) -->
-  <button class="btn-shutdown" id="shutdownBtn" onclick="confirmShutdown()">
-    ⏻ &nbsp;Stop &amp; Close Server
-  </button>
-
-</div>
-
-<!-- Shutdown confirm dialog -->
-<div class="shutdown-dialog" id="shutdownDialog">
-  <div class="shutdown-dialog-box">
-    <div class="icon">⏻</div>
-    <h3>Stop the server?</h3>
-    <p>This will stop the translation session and shut down the control panel. You'll need to relaunch the app to start again.</p>
-    <div class="shutdown-dialog-btns">
-      <button class="btn-cancel-shutdown" onclick="cancelShutdown()">Cancel</button>
-      <button class="btn-confirm-shutdown" onclick="doShutdown()">Stop Server</button>
-    </div>
-  </div>
 </div>
 
 <script>
@@ -972,11 +912,16 @@
       if (!r.ok) throw new Error();
       const devices = await r.json();
       sel.innerHTML = '';
+      // Every church interface is a Focusrite Scarlett, so preselect the first
+      // one to save the operator a step. Falls back to the first device when no
+      // Scarlett is plugged in. The operator still confirms before starting.
+      const scarlett = devices.findIndex(d => /scarlett/i.test(d.name));
+      const preselect = scarlett === -1 ? 0 : scarlett;
       devices.forEach((d, i) => {
         const opt = document.createElement('option');
         opt.value = d.index;
         opt.textContent = d.name;
-        if (i === 0) opt.selected = true;
+        if (i === preselect) opt.selected = true;
         sel.appendChild(opt);
       });
       deviceIndex = sel.value || null;
@@ -1099,12 +1044,16 @@
   }
 
   // ── Status helpers ─────────────────────────────────────────────────────────
-  function setStatus(state, message) {
+  // `hint` is the second line under the status. It defaults to empty (the bar
+  // collapses back to one line) and is only passed once a session has finished
+  // — see the stop handler.
+  function setStatus(state, message, hint = '') {
     const dot = document.getElementById('statusDot');
     const text = document.getElementById('statusText');
     dot.className = 'status-dot ' + state;
     text.className = 'status-text ' + state;
     text.textContent = message;
+    document.getElementById('statusHint').textContent = hint;
   }
 
   function showError(msg) {
@@ -1228,7 +1177,7 @@
       document.getElementById('mainBtn').textContent = 'Start Translation';
       document.getElementById('previewCard').style.display = 'none';
       document.getElementById('linksSection').style.display = 'none';
-      setStatus('ready', 'Session stopped');
+      setStatus('ready', 'Session stopped', 'Close tab when done');
       return;
     }
 
@@ -1270,7 +1219,6 @@
       document.getElementById('mainBtn').className = 'btn-main stop';
       document.getElementById('mainBtn').textContent = 'Stop Translation';
       document.getElementById('previewCard').style.display = 'block';
-      document.getElementById('shutdownBtn').style.display = 'block';
       document.getElementById('previewBox').innerHTML = '<span style="color:var(--muted);font-style:italic;font-size:14px">Waiting for speech…</span>';
       document.getElementById('linksSection').style.display = 'block';
       buildLinks();
@@ -1283,33 +1231,6 @@
       setStatus('error', 'Failed to start — check terminal for errors');
       showError(e.message);
     }
-  }
-
-  // ── Shutdown ───────────────────────────────────────────────────────────────
-  function confirmShutdown() {
-    document.getElementById('shutdownDialog').style.display = 'flex';
-  }
-
-  function cancelShutdown() {
-    document.getElementById('shutdownDialog').style.display = 'none';
-  }
-
-  async function doShutdown() {
-    document.getElementById('shutdownDialog').style.display = 'none';
-    const btn = document.getElementById('shutdownBtn');
-    btn.textContent = 'Stopping…';
-    btn.disabled = true;
-    try {
-      await fetch('/api/shutdown', { method: 'POST' });
-    } catch(e) {
-      // Expected — server kills itself so connection drops
-    }
-    // Show a clean "closed" state
-    document.body.innerHTML = '<div style="height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;font-family:system-ui;color:#7a8494;background:#0d0f12">' +
-      '<div style="font-size:48px">✓</div>' +
-      '<div style="font-size:18px;color:#f0f2f5">Server stopped</div>' +
-      '<div style="font-size:14px">You can close this tab and quit the app.</div>' +
-      '</div>';
   }
 
   // ── Heartbeat — tell server this tab is alive ──────────────────────────────

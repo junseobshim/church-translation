@@ -15,8 +15,9 @@ SONIOX_WEBSOCKET_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 
 # ── Soniox Config ─────────────────────────────────────────────────────────────
 
-TERMS_KO = ["하나님", "예수님", "성령", "아멘", "목사님", "집사님", "장로님", "권사님", "전도사님"]
-TERMS_EN = ["God", "Jesus", "Holy Spirit", "amen", "Pastor"]
+TERMS_KO = ["하나님", "예수님", "성령", "아멘", "목사님", "집사님", "장로님", "권사님", "전도사님",
+            "그루터기 교회"]
+TERMS_EN = ["God", "Jesus", "Holy Spirit", "amen", "Pastor", "Remnant Church"]
 TERMS_ES = ["Dios", "Jesús", "Cristo", "Espíritu Santo", "amén", "Pastor", "hermano", "hermana", "iglesia"]
 
 SOURCE_TERMS = {
@@ -66,6 +67,9 @@ def build_soniox_config(source: str, api_key: str) -> dict:
             "general": [
                 {"key": "domain", "value": "Religion"},
                 {"key": "topic", "value": topic},
+                # Official name in both languages, so the church name is
+                # transcribed as spoken rather than as a similar-sounding word.
+                {"key": "organization", "value": "Remnant Church (그루터기 교회)"},
             ],
             "text": text,
             "terms": SOURCE_TERMS[source],

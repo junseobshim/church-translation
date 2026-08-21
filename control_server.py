@@ -45,6 +45,15 @@ _http_server: Optional[http.server.HTTPServer] = None
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def _ignore_further_signals() -> None:
+    """Make shutdown one-shot, so teardown always runs to completion."""
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass  # not the main thread; the handler is already installed there
+
+
 def get_audio_devices() -> List[Dict]:
     """Return list of audio input devices via sounddevice."""
     try:
@@ -244,7 +253,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self._json(500, {"error": str(e)})
 
     # ── /api/stop ──────────────────────────────────────────────────────────────
-    def _handle_stop(self):
+    def _handle_stop(self, respond: bool = True):
+        """Stop the running session. `respond=False` lets _handle_shutdown reuse
+        this without writing a second HTTP response onto the same connection."""
         global _session_proc, _outline_temp
 
         with _session_lock:
@@ -268,7 +279,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     pass
                 _outline_temp = None
 
-        self._json(200, {"ok": True})
+        if respond:
+            self._json(200, {"ok": True})
 
     # ── /api/status ────────────────────────────────────────────────────────────
     def _serve_status(self):
@@ -359,12 +371,40 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 
     # ── /api/shutdown ─────────────────────────────────────────────────────────
     def _handle_shutdown(self):
-        """Stop translation session and shut down the control server cleanly."""
-        self._handle_stop()
+        """Force an immediate teardown: stop the session, then stop the server.
+
+        NOT DEAD CODE, despite having no caller in control.html — the panel's
+        "Stop & Close Server" button was removed once closing the tab was shown
+        to tear down just as cleanly. This is the manual override:
+
+            curl -X POST http://<host>:9090/api/shutdown
+
+        Reach for it when the normal paths can't work:
+
+        * A stale tab is pinning a session open. /api/goodbye is deliberately
+          cancelable — any tab still heartbeating within _GOODBYE_GRACE calls
+          the shutdown off. So if the panel is open on an unattended machine
+          (screen locked, operator gone), you cannot stop it by opening the
+          panel elsewhere and closing it again: the original tab keeps voting
+          to stay alive. This endpoint does not consult the heartbeat.
+        * You need to stop a session without physical access to the machine.
+          Any device on the same network can hit it.
+
+        Prefer closing the panel tab when you can actually reach the browser,
+        and Ctrl+C when you can reach the terminal — both run the same cleanup
+        with a grace period this skips. `kill`/`pkill` is also safe now (main()
+        installs a SIGTERM handler), but needs a shell on the host.
+
+        Unauthenticated and bound to all interfaces, like every other route
+        here — anyone on the church network can end a live service with it. See
+        the network-exposure item in the audit notes; the fix is to gate the
+        whole API, not to single this route out.
+        """
+        self._handle_stop(respond=False)
         self._json(200, {"ok": True})
         def _do_shutdown():
             time.sleep(0.5)
-            print("[ControlServer] Shutdown requested via UI.")
+            print("[ControlServer] Shutdown requested via /api/shutdown.")
             if _http_server:
                 _http_server.shutdown()
         threading.Thread(target=_do_shutdown, daemon=True).start()
@@ -400,12 +440,37 @@ def main():
                         help="Port for the control panel (default: 9090)")
     args = parser.parse_args()
 
-    global _http_server
+    global _http_server, _outline_temp
     # ThreadingHTTPServer: requests are handled concurrently, so a slow
     # /api/latest proxy or a blocking /api/stop can't queue heartbeats behind
     # it and trip the liveness watchdog mid-session.
     _http_server = http.server.ThreadingHTTPServer(("", args.port), ControlHandler)
     server = _http_server
+
+    # Route both signals through the finally block below. Two separate problems:
+    #
+    #   SIGTERM has no handler by default, so its default action kills this
+    #   process outright without unwinding — the session and its cloudflared
+    #   tunnel survive as orphans, still registered against the shared named
+    #   tunnel and breaking routing for other devices. That makes `kill` and
+    #   `pkill -f control_server.py` actively worse than doing nothing.
+    #
+    #   SIGINT is ignored rather than fatal: the launcher backgrounds this
+    #   process (`… &`), which sets the process tree's SIGINT disposition to
+    #   SIG_IGN, and CPython preserves an inherited SIG_IGN instead of
+    #   installing its own handler. Ctrl+C in that terminal would do nothing.
+    #
+    # Installing an explicit handler for both fixes each case. Done before
+    # serve_forever so no signal can arrive with a session up but no handler
+    # yet. Raising rather than calling server.shutdown() is deliberate —
+    # shutdown() blocks until serve_forever returns, which would deadlock when
+    # called from the main thread.
+    def _graceful_shutdown(signum, frame):
+        _ignore_further_signals()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
 
     # Heartbeat watcher — backstop that shuts down if the browser disappears
     # without a goodbye (Chrome force-quit, power loss, tab discarded).
@@ -441,17 +506,42 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Reached by every shutdown path — Ctrl+C, SIGTERM, the /api/goodbye
+        # beacon the panel sends on tab close, /api/shutdown, and the heartbeat
+        # watchdog. Tab close is the normal way operators end a session, so this
+        # has to clean up as thoroughly as an explicit stop would.
+        #
+        # Teardown waits up to 5s for the session to exit, and a signal arriving
+        # in that window (the launcher's cleanup, an impatient second Ctrl+C)
+        # would raise here and abort it partway. _graceful_shutdown already
+        # muted signals, but the goodbye/shutdown/watchdog paths reach the
+        # finally without passing through it.
+        _ignore_further_signals()
         print("\n[ControlServer] Shutting down…")
         with _session_lock:
             if _session_proc and _session_proc.poll() is None:
                 try:
                     _session_proc.send_signal(signal.SIGINT)
-                    _session_proc.wait(timeout=3)
+                    # 5s: main.py allows itself up to 3s to terminate the
+                    # cloudflared tunnel, so a shorter wait here would fall
+                    # through to terminate() while that teardown is still
+                    # running.
+                    _session_proc.wait(timeout=5)
                 except Exception:
                     try:
                         _session_proc.terminate()
                     except Exception:
                         pass
+
+            # Outlines are written with delete=False, so nothing reclaims them
+            # if the process exits without going through /api/stop. /tmp is
+            # shared across macOS accounts — don't leave sermon text there.
+            if _outline_temp:
+                try:
+                    os.unlink(_outline_temp.name)
+                except Exception:
+                    pass
+                _outline_temp = None
         server.server_close()
 
 

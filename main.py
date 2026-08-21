@@ -76,23 +76,32 @@ REGISTER_BY_TARGET = {
 # Religious nouns (하나님, Dios, etc.) live in the Soniox terms list; Claude
 # translates them naturally without hints. This table is for proper nouns and
 # address-form overrides specific to a direction pair.
+#
+# 그루터기 교회 / Remnant Church is the church's official name in each language,
+# not a translation of the other — without the hint Claude renders it literally
+# ("Stump Church"). There is no official Spanish name, so es targets are left to
+# translate it naturally.
+CHURCH_TO_EN = ('그루터기 교회 → Remnant Church (the church\'s official English '
+                'name — never render it literally, e.g. "Stump Church")')
+CHURCH_TO_KO = "Remnant Church → 그루터기 교회"
+
 TERM_PREFS_BY_PAIR = {
-    ("ko", "en"):    "여러분 → everyone; 정목사 → Pastor Chung.",
+    ("ko", "en"):    f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
     ("ko", "es"):    "여러분 → todos; 정목사 → Pastor Chung.",
-    ("en", "ko"):    "",
+    ("en", "ko"):    f"{CHURCH_TO_KO}.",
     ("en", "es"):    "",
     ("es", "en"):    "",
-    ("es", "ko"):    "",
+    ("es", "ko"):    f"{CHURCH_TO_KO}.",
     # Same-language targets: a bilingual source (ko+en or es+en) may also select
     # its base language as a target, so matching segments pass through unchanged
-    # and no proper-noun overrides apply. --source en is pure English and never
-    # targets en, so there is no (en, en) entry.
-    ("ko", "ko"):    "",
+    # and only overrides for the source's *other* language apply. --source en is
+    # pure English and never targets en, so there is no (en, en) entry.
+    ("ko", "ko"):    f"{CHURCH_TO_KO}.",
     ("es", "es"):    "",
     # multi → any: use ko-specific prefs since 정목사 only appears in Korean speech.
-    ("multi", "en"): "여러분 → everyone; 정목사 → Pastor Chung.",
+    ("multi", "en"): f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
     ("multi", "es"): "여러분 → todos; 정목사 → Pastor Chung.",
-    ("multi", "ko"): "",
+    ("multi", "ko"): f"{CHURCH_TO_KO}.",
 }
 
 SOURCE_COMPOSITION = {
