@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from typing import Callable, Optional
 
@@ -15,9 +16,8 @@ SONIOX_WEBSOCKET_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 
 # ── Soniox Config ─────────────────────────────────────────────────────────────
 
-TERMS_KO = ["하나님", "예수님", "성령", "아멘", "목사님", "집사님", "장로님", "권사님", "전도사님",
-            "그루터기 교회"]
-TERMS_EN = ["God", "Jesus", "Holy Spirit", "amen", "Pastor", "Remnant Church"]
+TERMS_KO = ["하나님", "예수님", "성령", "아멘", "목사님", "집사님", "장로님", "권사님", "전도사님"]
+TERMS_EN = ["God", "Jesus", "Holy Spirit", "amen", "Pastor"]
 TERMS_ES = ["Dios", "Jesús", "Cristo", "Espíritu Santo", "amén", "Pastor", "hermano", "hermana", "iglesia"]
 
 SOURCE_TERMS = {
@@ -49,6 +49,33 @@ def build_soniox_config(source: str, api_key: str) -> dict:
     tokens, so it would never trip the gate. `af` is unused across all sources.
     """
     topic, text = SOURCE_CONTEXT[source]
+
+    # Church name is optional and church-specific (set via CHURCH_NAME_KO /
+    # CHURCH_NAME_EN, e.g. in .env) rather than hardcoded, so any church can
+    # configure their own official name without a code change. Read here
+    # rather than at import time so a value set only in .env (loaded later,
+    # in main()) is honored.
+    church_ko = os.environ.get("CHURCH_NAME_KO", "").strip()
+    church_en = os.environ.get("CHURCH_NAME_EN", "").strip()
+    have_church = bool(church_ko and church_en)
+
+    terms = list(SOURCE_TERMS[source])
+    if have_church:
+        terms.append(church_en)
+        if source in ("ko", "multi"):
+            terms.append(church_ko)
+
+    general_context = [
+        {"key": "domain", "value": "Religion"},
+        {"key": "topic", "value": topic},
+    ]
+    if have_church:
+        # Official name in both languages, so the church name is
+        # transcribed as spoken rather than as a similar-sounding word.
+        general_context.append(
+            {"key": "organization", "value": f"{church_en} ({church_ko})"}
+        )
+
     return {
         "api_key": api_key,
         "model": "stt-rt-v4",
@@ -64,15 +91,9 @@ def build_soniox_config(source: str, api_key: str) -> dict:
             "target_language": "af",
         },
         "context": {
-            "general": [
-                {"key": "domain", "value": "Religion"},
-                {"key": "topic", "value": topic},
-                # Official name in both languages, so the church name is
-                # transcribed as spoken rather than as a similar-sounding word.
-                {"key": "organization", "value": "Remnant Church (그루터기 교회)"},
-            ],
+            "general": general_context,
             "text": text,
-            "terms": SOURCE_TERMS[source],
+            "terms": terms,
         },
     }
 
