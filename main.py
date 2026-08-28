@@ -77,32 +77,45 @@ REGISTER_BY_TARGET = {
 # translates them naturally without hints. This table is for proper nouns and
 # address-form overrides specific to a direction pair.
 #
-# 그루터기 교회 / Remnant Church is the church's official name in each language,
-# not a translation of the other — without the hint Claude renders it literally
-# ("Stump Church"). There is no official Spanish name, so es targets are left to
-# translate it naturally.
-CHURCH_TO_EN = ('그루터기 교회 → Remnant Church (the church\'s official English '
-                'name — never render it literally, e.g. "Stump Church")')
-CHURCH_TO_KO = "Remnant Church → 그루터기 교회"
+# The church's official name and the pastor's name are church-specific and not
+# hardcoded here — they come from CHURCH_NAME_KO/CHURCH_NAME_EN and
+# PASTOR_NAME_KO/PASTOR_NAME_EN (env vars, e.g. via .env), so any church can
+# configure their own without a code change. Without them, Claude just
+# translates those words naturally (which may render a name literally, e.g.
+# "Stump Church" — set the church name vars to fix that for churches with a
+# name that isn't a literal translation between languages).
+def _term_prefs(source: str, target: str) -> str:
+    name_ko = os.environ.get("CHURCH_NAME_KO", "").strip()
+    name_en = os.environ.get("CHURCH_NAME_EN", "").strip()
+    pastor_ko = os.environ.get("PASTOR_NAME_KO", "").strip()
+    pastor_en = os.environ.get("PASTOR_NAME_EN", "").strip()
+    have_church = bool(name_ko and name_en)
+    have_pastor = bool(pastor_ko and pastor_en)
 
-TERM_PREFS_BY_PAIR = {
-    ("ko", "en"):    f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
-    ("ko", "es"):    "여러분 → todos; 정목사 → Pastor Chung.",
-    ("en", "ko"):    f"{CHURCH_TO_KO}.",
-    ("en", "es"):    "",
-    ("es", "en"):    "",
-    ("es", "ko"):    f"{CHURCH_TO_KO}.",
-    # Same-language targets: a bilingual source (ko+en or es+en) may also select
-    # its base language as a target, so matching segments pass through unchanged
-    # and only overrides for the source's *other* language apply. --source en is
-    # pure English and never targets en, so there is no (en, en) entry.
-    ("ko", "ko"):    f"{CHURCH_TO_KO}.",
-    ("es", "es"):    "",
-    # multi → any: use ko-specific prefs since 정목사 only appears in Korean speech.
-    ("multi", "en"): f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
-    ("multi", "es"): "여러분 → todos; 정목사 → Pastor Chung.",
-    ("multi", "ko"): f"{CHURCH_TO_KO}.",
-}
+    church_to_en = (
+        f'{name_ko} → {name_en} (the church\'s official English name — '
+        "never render it literally)"
+    ) if have_church else ""
+    church_to_ko = f"{name_en} → {name_ko}" if have_church else ""
+
+    # ko/multi → en/es: 정목사-style pastor hint only applies here since a
+    # Korean honorific never appears in en/es source speech.
+    if source in ("ko", "multi") and target in ("en", "es"):
+        everyone = "everyone" if target == "en" else "todos"
+        parts = [f"여러분 → {everyone}"]
+        if have_pastor:
+            parts.append(f"{pastor_ko} → {pastor_en}")
+        if target == "en" and have_church:
+            # No official Spanish church name, so es targets translate it naturally.
+            parts.append(church_to_en)
+        return "; ".join(parts) + "."
+
+    # Anything targeting ko (including ko → ko passthrough) gets the reverse
+    # church-name hint, regardless of source.
+    if target == "ko":
+        return f"{church_to_ko}." if have_church else ""
+
+    return ""
 
 SOURCE_COMPOSITION = {
     "ko":    "Korean (with occasional English)",
@@ -158,7 +171,7 @@ def build_prompt(source: str, target: str) -> str:
         f"Translate segments in other languages into {tname}, even if they repeat "
         "or paraphrase already-translated content — always include both."
     )
-    prefs = TERM_PREFS_BY_PAIR[(source, target)]
+    prefs = _term_prefs(source, target)
     prefs_clause = f"Preferred terms: {prefs} " if prefs else ""
     return (
         f"You are a live translation assistant for a {SOURCE_COMPOSITION[source]} church sermon. "

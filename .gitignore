@@ -25,3 +25,8 @@ worker/.wrangler/
 
 # Apps (for one click launch)
 *.app
+
+# Swift package build artifacts + staged Python runtime (app/build/stage_python.sh output)
+app/.build/
+app/.build-cache/
+app/Resources/
