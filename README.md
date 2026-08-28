@@ -1,6 +1,6 @@
 # Live Church Sermon Translation
 
-_Last updated: August 3, 2026_
+_Last updated: August 28, 2026_
 
 Real-time sermon translation using [Soniox](https://soniox.com/) real-time STT and [Claude](https://anthropic.com/) for translation, with a built-in web display for ProPresenter or any browser. Supports Korean, English, and Spanish — in any source/target combination, including multilingual (ko+en+es) sermons. Each translation target runs on its own parallel worker, so one Korean phrase can be translated into English and Spanish simultaneously on separate URLs.
 
@@ -74,6 +74,7 @@ Open in any browser or ProPresenter Web Fill:
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph`                                                                             | English translations, paragraph style                                                                                        |
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=96&fontWeight=500&lineSpacing=1.3&bgColor=transparent&hideStatus=1` | English translations default for RCC Sanctuary TV display (ProPresenter web fill — transparent overlay, no status indicator) |
 | `http://localhost:8080/?mode=transcription&lang=ko`                                                                                             | Only Korean transcription segments (explicit filter on the transcription stream)                                             |
+| `http://localhost:8080/?mode=translation&slot=1&display=paragraph&bgColor=transparent&hideStatus=1`                                             | Two-slot multilingual mode, box 1 — see **Two-slot mode** below. `slot=2` for the second box.                                |
 
 
 
@@ -81,6 +82,27 @@ Open in any browser or ProPresenter Web Fill:
 ### Scroll-back
 
 Any caption viewer supports scrolling up to read previous captions during a live service. Scrolling up detaches the view from auto-follow; a **Back to Live** button appears and snaps back to the current caption when clicked. Caption history is preserved for the last 3 minutes by default (configurable via `?historyMinutes=`), and old lines age out of the DOM automatically — but only while pinned to the live edge, so a viewer scrolled back to read history never has content pruned out from under them.
+
+### Two-slot mode (experimental, multilingual services only)
+
+A trilingual service has three languages, but a projection screen only has room for two caption boxes. `?slot=1` and `?slot=2` fill that gap: each box shows one of the two languages that are **not** currently being spoken, so whichever language the speaker switches into, the other two are always on screen.
+
+Point one ProPresenter web-fill text box at each. The control panel lists both links after Start whenever the source is **Multilingual** — they're hidden for every other source, since the mode needs all three targets running.
+
+Routing is decided per caption line rather than by tracking a "current speaker language", so the two boxes can never disagree or lag each other. With the default priority order `ko,en,es` each box gets a home language, and English backfills whichever box's home language is being spoken:
+
+| Language being spoken | Slot 1      | Slot 2      |
+| --------------------- | ----------- | ----------- |
+| English               | Korean      | Spanish     |
+| Korean                | **English** | Spanish     |
+| Spanish               | Korean      | **English** |
+
+So only one box ever changes at a time, and only while its own home language is being spoken. In paragraph display the viewer forces a line break wherever the language changes, so a switch always reads as a new line instead of flowing into the previous sentence.
+
+Two things to know before relying on it:
+
+- **Mixed-language phrases.** A phrase is routed by the language it is *mostly* in. If the speaker code-switches inside a single phrase — an English sentence with a Korean quotation in it — that phrase counts as English throughout, so the embedded Korean is not separately surfaced to English readers. Switches *between* phrases, the normal case, are handled exactly.
+- **Non-multilingual sessions.** A box left pointing at `?slot=` during, say, a Korean → English service falls back to whatever targets are actually running: slot 1 shows English and slot 2 stays empty, rather than showing something wrong.
 
 ### Query Parameters
 
@@ -104,6 +126,8 @@ Any caption viewer supports scrolling up to read previous captions during a live
 | `padding`     | `20`                                                                    | Container padding in px                                                                                                                                                               |
 | `maxLines`    | `0` (unlimited)                                                         | Max lines displayed (hard cap 200)                                                                                                                                                    |
 | `historyMinutes` | `3`                                                                  | How many minutes of caption history to preserve for scroll-back. Minimum 1. Old lines age out automatically while pinned to the live edge.                                            |
+| `slot`        | —                                                                       | `1` or `2`. Two-slot multilingual mode (see above): shows one of the two languages not currently being spoken. Overrides `mode`/`lang`, and disables the View dropdown.                |
+| `priority`    | `ko,en,es`                                                              | Slot priority order — all three codes, comma-separated. Slot 1 takes the first language left after removing the one being spoken, slot 2 the second.                                  |
 
 
 

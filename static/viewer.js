@@ -69,6 +69,57 @@
   const legacyMode = params.get("mode");
   const legacyLang = params.get("lang");
 
+  // Two-slot multilingual mode (?slot=1 / ?slot=2). Each box shows one of the
+  // two languages that are NOT currently being spoken, so a trilingual service
+  // covers all three languages with two ProPresenter text boxes.
+  //
+  // Routing is a pure function of the line itself — no "what is being spoken
+  // right now" state, no timers, so the two boxes can never disagree. For a
+  // translation line spoken in `src` and targeted at `lang`: drop `src` from
+  // the priority order and this slot takes what is left at its index. A line
+  // whose target equals the spoken language (the same-language passthrough
+  // every worker emits) can never match, which is exactly what we want.
+  //
+  // With the default priority [ko, en, es] each box gets a home language —
+  // slot 1 Korean, slot 2 Spanish — and English backfills whichever box's home
+  // language is being spoken:
+  //
+  //   spoken en → slot 1 ko, slot 2 es
+  //   spoken ko → slot 1 en, slot 2 es
+  //   spoken es → slot 1 ko, slot 2 en
+  //
+  // so only one box ever changes at a time, and only during its own language.
+  const DEFAULT_SLOT_PRIORITY = ["ko", "en", "es"];
+  const rawSlot = parseInt(params.get("slot"), 10);
+  const slotMode = rawSlot === 1 || rawSlot === 2;
+  const slotIndex = rawSlot - 1;
+  const slotPriority = (function () {
+    const raw = params.get("priority");
+    if (!raw) return DEFAULT_SLOT_PRIORITY;
+    const picked = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter((l, i, a) => LANG_ORDER.includes(l) && a.indexOf(l) === i);
+    return picked.length === LANG_ORDER.length ? picked : DEFAULT_SLOT_PRIORITY;
+  })();
+
+  // Targets the operator is actually running, once /api/config confirms them;
+  // null while unknown. Slot routing intersects the priority order with this
+  // so a box pointed at a session that isn't trilingual degrades to showing
+  // the languages that do exist rather than filtering everything out.
+  let runningTargets = null;
+
+  function slotPool() {
+    if (!runningTargets) return slotPriority;
+    return slotPriority.filter((l) => runningTargets.includes(l));
+  }
+
+  function slotLang(src) {
+    if (!src) return null; // pre-slot server payload — nothing safe to show
+    const remaining = slotPool().filter((l) => l !== src);
+    return remaining[slotIndex] || null;
+  }
+
   const HISTORY_MS =
     Math.max(1, parseInt(params.get("historyMinutes") || "3", 10)) * 60 * 1000;
   const maxLines = Math.min(
@@ -206,7 +257,8 @@
   function reflectPanelState() {
     fontSizeValue.textContent = settings.fontSize + "px";
     fontFamilySelect.value = settings.fontFamily;
-    if (!legacyMultiLang && viewSelect.querySelector('option[value="' + settings.view + '"]')) {
+    if (!legacyMultiLang && !slotMode &&
+        viewSelect.querySelector('option[value="' + settings.view + '"]')) {
       viewSelect.value = settings.view;
     }
     themeToggle.querySelectorAll(".theme-toggle-option").forEach((el) => {
@@ -223,6 +275,13 @@
   let langs = [];
 
   function applyView() {
+    if (slotMode) {
+      // Language selection is per line (see slotLang); `langs` stays empty so
+      // the multi-language column path and langAllowed() both stay out of it.
+      mode = "translation";
+      langs = [];
+      return;
+    }
     if (legacyMultiLang) {
       mode = "translation";
       langs = legacyLangs;
@@ -250,6 +309,14 @@
     return langs.includes(lang);
   }
 
+  // The one filter the poll loop applies to an incoming line.
+  function shouldRender(line) {
+    if (slotMode) {
+      return line.kind === "translation" && line.lang === slotLang(line.src);
+    }
+    return line.kind === mode && langAllowed(line.lang);
+  }
+
   // ── /api/config: populate the View dropdown, validate the saved view ────
 
   function buildViewOptions(targets) {
@@ -267,13 +334,15 @@
       viewSelect.appendChild(opt);
     });
 
-    if (legacyMultiLang) {
+    if (legacyMultiLang || slotMode) {
       viewSelect.disabled = true;
       const opt = document.createElement("option");
-      opt.value = "__legacy__";
-      opt.textContent = "Multiple (set by URL)";
+      opt.value = "__locked__";
+      opt.textContent = slotMode
+        ? "Slot " + rawSlot + " (set by URL)"
+        : "Multiple (set by URL)";
       viewSelect.appendChild(opt);
-      viewSelect.value = "__legacy__";
+      viewSelect.value = "__locked__";
     }
   }
 
@@ -299,6 +368,17 @@
     }
 
     buildViewOptions(targets);
+
+    // Slot routing intersects the priority order with the running targets, so
+    // learning them (or losing them) changes what each slot resolves to. Only
+    // re-hydrate when it actually changed — initConfig retries on failure.
+    const poolBefore = slotPool().join(",");
+    runningTargets = configReachable ? targets : null;
+    if (slotMode) {
+      if (slotPool().join(",") !== poolBefore) resetRenderedCaptions();
+      reflectPanelState();
+      return;
+    }
 
     // The one piece of required behavior: a saved (or URL-seeded) language
     // that isn't among the operator's current targets falls back to
@@ -349,7 +429,7 @@
   });
 
   viewSelect.addEventListener("change", () => {
-    if (legacyMultiLang) return;
+    if (legacyMultiLang || slotMode) return;
     settings.view = viewSelect.value;
     saveSettings();
     applyView();
@@ -397,11 +477,13 @@
   let hasReceivedData = false;
   let pollDelay = FAST_MS;
   let pinnedToBottom = true;
+  let lastAppendedLang = null;
   const recentGroups = [];
 
   function resetRenderedCaptions() {
     linesDiv.innerHTML = "";
     recentGroups.length = 0;
+    lastAppendedLang = null;
     lastCount = 0;
     lastUpdated = 0;
     hasReceivedData = false;
@@ -521,18 +603,29 @@
     group.timer = setTimeout(() => flushGroup(group), GROUP_WINDOW_MS);
   }
 
-  function appendSingleLine(text) {
+  function appendSingleLine(text, lang) {
     const ts = String(Date.now());
+    // Slot mode is the one view whose language changes mid-stream, so it is
+    // the one that needs a visible seam where it does. Line mode already has
+    // one (each caption is its own block); paragraph mode is a single flowing
+    // block, so force a break. It has to be a newline *inside* the span text —
+    // #lines is pre-wrap so it renders as a hard break, and the paragraph trim
+    // geometry (cutAtLineStart) requires every child to be a span with one
+    // text node. A <br> element would break its binary search outright.
+    const seam = slotMode && lastAppendedLang !== null && lang !== lastAppendedLang;
+    lastAppendedLang = lang;
     if (display === "paragraph") {
       const span = document.createElement("span");
       span.className = "span-item";
       span.dataset.ts = ts;
-      span.textContent = text + " ";
+      span.dataset.lang = lang;
+      span.textContent = (seam ? "\n" : "") + text + " ";
       linesDiv.appendChild(span);
     } else {
       const div = document.createElement("div");
       div.className = "line-item";
       div.dataset.ts = ts;
+      div.dataset.lang = lang;
       div.textContent = text;
       linesDiv.appendChild(div);
     }
@@ -751,8 +844,7 @@
       let appended = false;
 
       for (const line of newLines) {
-        if (line.kind !== mode) continue;
-        if (!langAllowed(line.lang)) continue;
+        if (!shouldRender(line)) continue;
 
         if (!overlayDismissed && !hasReceivedData) {
           hasReceivedData = true;
@@ -760,7 +852,7 @@
         }
 
         if (multiLangMode()) appendMultiLanguageLine(line);
-        else appendSingleLine(line.text);
+        else appendSingleLine(line.text, line.lang);
 
         appended = true;
       }

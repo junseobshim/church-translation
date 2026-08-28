@@ -1127,6 +1127,27 @@
     const localBase = `http://localhost:${port}`;
     const links = [];
 
+    // Experimental two-slot mode: multilingual services only, where all three
+    // languages run. Each box shows one of the two languages NOT currently
+    // being spoken — slot 1 is Korean, slot 2 is Spanish, and English backfills
+    // whichever box's home language the speaker switches into. Point one
+    // ProPresenter web-fill text box at each.
+    if (source === 'multi') {
+      const slotOpts = 'display=paragraph&fontSize=96&fontWeight=500' +
+                       '&lineSpacing=1.3&bgColor=transparent&hideStatus=1';
+      [
+        { slot: 1, home: 'Korean' },
+        { slot: 2, home: 'Spanish' },
+      ].forEach(({ slot, home }) => {
+        links.push({
+          icon: '🔀',
+          name: `Slot ${slot} · ${home} home`,
+          url: `${localBase}/?mode=translation&slot=${slot}&${slotOpts}`,
+          sub: 'ProPresenter web fill (experimental)',
+        });
+      });
+    }
+
     [...targets].forEach(lang => {
       const langName = {en:'English', ko:'Korean', es:'Spanish'}[lang];
       const flags = {en:'🇺🇸', ko:'🇰🇷', es:'🇪🇸'};

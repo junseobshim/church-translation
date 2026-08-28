@@ -57,3 +57,7 @@ python main.py --outline path/to/sermon.txt
 | `--translator {claude}`     | `claude`                                                                      | Translation backend. Loads `translate_<name>.py` at startup. More options will be added as alternative backends land (e.g. `qwen-mlx`, `gemini`).                                                           |
 
 **Environment variable:** Set `CLAUDE_MODEL` in `.env` to override the translation model (e.g. `CLAUDE_MODEL=claude-opus-4-8`). Applies at startup; takes precedence over the backend's `DEFAULT_MODEL`.
+
+**Effort level:** requests are pinned to `output_config.effort: "low"` (`EFFORT` in `translate_claude.py`). The API default is `high`; our output is one constrained sentence with no tools and no thinking, so there is little for a higher effort level to buy. It is sent identically on all three call shapes — cache warmup, translation, and keepalive — because changing effort between requests invalidates the cache they share.
+
+Not every model accepts the parameter: Sonnet 4.5 and Haiku 4.5 reject it with a 400, so it is only sent for the models in `EFFORT_MODELS`. Anything else — including a model set via `CLAUDE_MODEL` that isn't in that set — simply omits it and runs at the API default. If you point `CLAUDE_MODEL` at a model that does support effort and want it pinned low, add it to `EFFORT_MODELS`.

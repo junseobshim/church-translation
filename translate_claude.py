@@ -12,11 +12,36 @@ from main import OUTLINE_WRAPPER, build_prompt
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 CACHE_MIN_TOKENS = 1024
+
+# output_config.effort defaults to "high" when omitted. Our output is a single
+# constrained sentence with no tools and no thinking, so there is little for a
+# high effort level to buy — "low" trims token spend and generation time.
+EFFORT = "low"
+
+# Models that accept output_config.effort. Sonnet 4.5 and Haiku 4.5 reject it
+# outright with a 400, and CLAUDE_MODEL in .env can still select either, so
+# this is a real guard rather than a formality. An unrecognized model omits
+# effort entirely, which is the API default and the pre-existing behavior.
+EFFORT_MODELS = frozenset({"claude-sonnet-4-6", "claude-sonnet-5"})
 KEEPALIVE_IDLE_SECONDS = 270  # 4m30s; stay under the 5-minute ephemeral TTL
 KEEPALIVE_POLL_SECONDS = 10
 
 
 # ── Client factory ────────────────────────────────────────────────────────────
+
+
+def effort_kwargs(model: str) -> dict:
+    """Extra request kwargs pinning the effort level for `model`.
+
+    Must be applied identically to *every* call sharing a cached prefix —
+    warmup, translation and keepalive. Changing effort between requests
+    invalidates the messages cache, and on some models the system cache that
+    holds the outline too, so setting it on only some of them would quietly
+    undo the caching this module exists to set up.
+    """
+    if model not in EFFORT_MODELS:
+        return {}
+    return {"output_config": {"effort": EFFORT}}
 
 
 def make_client(api_key: str) -> anthropic.Anthropic:
@@ -89,6 +114,7 @@ def warm_cache(client: anthropic.Anthropic,
             max_tokens=1,
             system=system,
             messages=[{"role": "user", "content": "ready"}],
+            **effort_kwargs(model),
         )
     except Exception as e:
         sys.exit(f"Cache warmup failed: {e}")
@@ -161,6 +187,7 @@ class Backend:
             max_tokens=4096,
             system=self.system,
             messages=messages,
+            **effort_kwargs(self.model),
         )
         if resp.stop_reason == "max_tokens":
             print(f"[{self.target} translation truncated at max_tokens]",
@@ -192,6 +219,7 @@ class Backend:
                     max_tokens=1,
                     system=self.system,
                     messages=[{"role": "user", "content": "ready"}],
+                    **effort_kwargs(self.model),
                 )
                 self.mark_activity()
                 u = response.usage
