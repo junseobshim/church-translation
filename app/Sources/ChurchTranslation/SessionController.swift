@@ -22,13 +22,6 @@ final class SessionController {
         var id: Int { index }
     }
 
-    struct CaptionLine: Identifiable {
-        let id: Int
-        let kind: String // "transcription" | "translation"
-        let lang: String
-        let text: String
-    }
-
     struct TunnelOption: Identifiable, Equatable {
         let name: String
         let url: String?
@@ -40,26 +33,11 @@ final class SessionController {
         let name: String
     }
 
-    private struct RawCaptionLine: Decodable {
-        let kind: String
-        let lang: String
-        let text: String
-    }
-
-    private struct LatestResponse: Decodable {
-        let lines: [RawCaptionLine]
-        let start: Int
-        let total: Int
-    }
-
     static let shared = SessionController()
 
     private(set) var state: State = .idle
     private(set) var log: String = ""
     private(set) var startedAt: Date?
-    /// Mirrors control.html's live preview: last 12 lines from /api/latest,
-    /// polled every 400ms while a session is running.
-    private(set) var captionLines: [CaptionLine] = []
 
     /// Fired once after a running process has fully exited via stop(), then
     /// cleared. Used by AppDelegate to complete an in-flight app-quit only
@@ -69,9 +47,9 @@ final class SessionController {
     private var process: Process?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
-    private var pollTask: Task<Void, Never>?
-    private var pollLastCount = 0
-    private var nextCaptionID = 0
+    /// Set by stop(), cleared once the process actually exits — lets the
+    /// termination handler tell a requested stop apart from a crash.
+    private var stopRequested = false
 
     private func repoRoot() -> URL {
         URL(fileURLWithPath: #filePath)
@@ -306,11 +284,16 @@ final class SessionController {
     }
 
     func start(source: String, target: String, device: String, outlinePath: String? = nil, tunnel: String? = nil) {
-        guard case .idle = state else { return }
+        // Allow retrying from .failed (e.g. after a crash), just not while
+        // a session of ours is actually running.
+        if case .running = state { return }
         guard let python = resolvePython(), let mainPy = resolveMainPy() else {
             state = .failed("Could not find venv/bin/python3 or main.py next to the app checkout.")
             return
         }
+
+        selfHeal(tunnelName: tunnel)
+        stopRequested = false
 
         let proc = Process()
         proc.executableURL = python
@@ -342,6 +325,9 @@ final class SessionController {
         if let key = KeychainStore.get("ANTHROPIC_API_KEY"), !key.isEmpty {
             env["ANTHROPIC_API_KEY"] = key
         }
+        if let customTermsJSON = CustomTermsStore.envJSON() {
+            env["CUSTOM_TERMS"] = customTermsJSON
+        }
         proc.environment = env
 
         let outPipe = Pipe()
@@ -358,15 +344,25 @@ final class SessionController {
 
         proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
-                self?.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-                self?.stderrPipe?.fileHandleForReading.readabilityHandler = nil
-                self?.stopPolling()
-                self?.appendLogLine("[Process exited: \(p.terminationStatus)]")
-                self?.state = .idle
-                self?.process = nil
-                self?.startedAt = nil
-                self?.onStopped?()
-                self?.onStopped = nil
+                guard let self else { return }
+                self.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+                self.stderrPipe?.fileHandleForReading.readabilityHandler = nil
+                self.appendLogLine("[Process exited: \(p.terminationStatus)]")
+                // Crash detection (doc §Phase 3): distinguish a user-requested
+                // stop (always ends in .idle) from main.py dying on its own —
+                // today a dead session just looks stuck until someone checks
+                // the log tab, which this surfaces immediately instead.
+                if !self.stopRequested && p.terminationStatus != 0 {
+                    let tail = self.logTail(lines: 6)
+                    self.state = .failed("Session ended unexpectedly (exit \(p.terminationStatus)). Last log lines:\n\(tail)")
+                } else {
+                    self.state = .idle
+                }
+                self.process = nil
+                self.startedAt = nil
+                self.stopRequested = false
+                self.onStopped?()
+                self.onStopped = nil
             }
         }
 
@@ -377,7 +373,6 @@ final class SessionController {
             stderrPipe = errPipe
             state = .running(pid: proc.processIdentifier)
             startedAt = Date()
-            startPolling()
         } catch {
             state = .failed("Failed to launch: \(error.localizedDescription)")
         }
@@ -385,7 +380,7 @@ final class SessionController {
 
     func stop() {
         guard let proc = process, proc.isRunning else { return }
-        stopPolling()
+        stopRequested = true
         // SIGINT first — matches main.py's _graceful_shutdown handler, which
         // tears down the tunnel/session cleanly. Escalate to SIGTERM only if
         // it doesn't exit in time.
@@ -397,50 +392,49 @@ final class SessionController {
         }
     }
 
-    private func startPolling() {
-        pollLastCount = 0
-        nextCaptionID = 0
-        captionLines = []
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            while let self, !Task.isCancelled {
-                await self.pollLatest()
-                try? await Task.sleep(nanoseconds: 400_000_000)
-            }
+    private func logTail(lines: Int) -> String {
+        let allLines = log.split(separator: "\n", omittingEmptySubsequences: false)
+        return allLines.suffix(lines).joined(separator: "\n")
+    }
+
+    /// Startup self-heal, ported from launcher.sh: a previous force-quit or
+    /// power loss can leave a stale process on port 8080 or an orphaned
+    /// cloudflared tunnel still registered, which would make a fresh session
+    /// fail to bind or compete for the shared named tunnel. Only ever called
+    /// from start(), which is guarded against our own live session, so this
+    /// never touches a session we're actually tracking.
+    private func selfHeal(tunnelName: String?) {
+        killProcesses(executableURL: URL(fileURLWithPath: "/usr/sbin/lsof"), arguments: ["-ti", ":8080"])
+        if let tunnelName, !tunnelName.isEmpty {
+            killProcesses(
+                executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
+                arguments: ["-f", "cloudflared tunnel run.*\(tunnelName)"]
+            )
         }
     }
 
-    private func stopPolling() {
-        pollTask?.cancel()
-        pollTask = nil
-    }
-
-    @MainActor
-    private func pollLatest() async {
-        guard let url = URL(string: "http://localhost:8080/api/latest") else { return }
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let latest = try? JSONDecoder().decode(LatestResponse.self, from: data) else {
+    /// Runs a PID-listing command (lsof/pgrep) and SIGKILLs every PID it
+    /// prints. Synchronous and brief (~tens of ms) — matches launcher.sh's
+    /// own synchronous shell self-heal, run once right before a fresh start.
+    private func killProcesses(executableURL: URL, arguments: [String]) {
+        let proc = Process()
+        proc.executableURL = executableURL
+        proc.arguments = arguments
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
             return
         }
-
-        // Mirrors control.html's startPoll(): the server keeps only a recent
-        // window of lines, so track position via absolute start/total indices,
-        // not lines.count. total < pollLastCount means the server restarted.
-        if latest.total < pollLastCount {
-            pollLastCount = latest.start
-        }
-        let skip = max(0, pollLastCount - latest.start)
-        let freshLines = latest.lines.count > skip ? Array(latest.lines[skip...]) : []
-        pollLastCount = latest.total
-        guard !freshLines.isEmpty else { return }
-
-        for raw in freshLines {
-            nextCaptionID += 1
-            captionLines.append(CaptionLine(id: nextCaptionID, kind: raw.kind, lang: raw.lang, text: raw.text))
-        }
-        if captionLines.count > 12 {
-            captionLines.removeFirst(captionLines.count - 12)
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return }
+        for line in text.split(separator: "\n") {
+            if let pid = Int32(line.trimmingCharacters(in: .whitespaces)) {
+                kill(pid, SIGKILL)
+            }
         }
     }
 

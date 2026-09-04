@@ -25,7 +25,8 @@ struct ContentView: View {
             logPanel
                 .tabItem { Label("Log", systemImage: "terminal") }
         }
-        .frame(minWidth: 600, minHeight: 560)
+        .frame(minWidth: 600)
+        .navigationTitle("Church Translation Control Panel")
         .task {
             await loadDevices()
             await loadTunnels()
@@ -33,37 +34,43 @@ struct ContentView: View {
     }
 
     private var controlPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Church Translation — walking skeleton")
-                .font(.headline)
+        // ScrollView instead of a bare VStack: pins content to the top (no more
+        // vertical centering when the window is taller than the content) and,
+        // if content ever exceeds the window's height (e.g. a large crash
+        // message), makes it scrollable instead of clipped.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Church Translation Control Panel")
+                    .font(.headline)
 
-            sourcePicker
-            targetPicker
-            devicePicker
-            outlinePicker
-            tunnelPicker
+                sourcePicker
+                targetPicker
+                devicePicker
+                outlinePicker
+                tunnelPicker
 
-            HStack {
-                Button(isRunning ? "Stop" : "Start") {
-                    if isRunning {
-                        session.stop()
-                    } else {
-                        let device = selectedDeviceIndex.map(String.init) ?? ""
-                        session.start(source: languages.source, target: languages.targetsCSV,
-                                     device: device, outlinePath: outlineTempPath, tunnel: selectedTunnel)
+                HStack {
+                    Button(isRunning ? "Stop" : "Start") {
+                        if isRunning {
+                            session.stop()
+                        } else {
+                            let device = selectedDeviceIndex.map(String.init) ?? ""
+                            session.start(source: languages.source, target: languages.targetsCSV,
+                                         device: device, outlinePath: outlineTempPath, tunnel: selectedTunnel)
+                        }
                     }
+                    .disabled(languages.targets.isEmpty)
                 }
-                .disabled(languages.targets.isEmpty)
-            }
 
-            statusLine
-            if isRunning {
-                linksView
+                statusLine
+                if isRunning {
+                    linksView
+                }
             }
-            captionPreview
-            Spacer()
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding()
+        .scrollIndicators(.visible)
     }
 
     private var logPanel: some View {
@@ -75,6 +82,7 @@ struct ContentView: View {
                 .padding(8)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .scrollIndicators(.visible)
     }
 
     private func loadDevices() async {
@@ -91,12 +99,12 @@ struct ContentView: View {
         isLoadingTunnels = true
         let found = await session.listTunnels()
         tunnels = found
-        // tunnels.json's own ordering convention: first entry is the default
-        // (mirrors control.html's tunnel-select behavior).
-        if selectedTunnel == nil {
-            selectedTunnel = found.first?.name
-        } else if let selectedTunnel, !found.contains(where: { $0.name == selectedTunnel }) {
-            self.selectedTunnel = found.first?.name
+        // Default to Off (local only) — the operator opts into a tunnel
+        // explicitly rather than it being picked automatically. If a
+        // previously-selected tunnel disappears (list refreshed, no longer
+        // runnable here), fall back to Off too, not to some other tunnel.
+        if let selectedTunnel, !found.contains(where: { $0.name == selectedTunnel }) {
+            self.selectedTunnel = nil
         }
         isLoadingTunnels = false
     }
@@ -118,32 +126,6 @@ struct ContentView: View {
             }
             .disabled(isRunning || isLoadingDevices)
         }
-    }
-
-    /// Live preview of /api/latest — same source of truth the web caption
-    /// viewer polls, mirroring control.html's startPoll() behavior (last 12
-    /// lines, transcription vs. translation styled distinctly).
-    private var captionPreview: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 4) {
-                if session.captionLines.isEmpty {
-                    Text("No captions yet").foregroundStyle(.secondary)
-                }
-                ForEach(session.captionLines) { line in
-                    HStack(alignment: .top, spacing: 6) {
-                        Text("[\(line.lang)]")
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                        Text(line.text)
-                            .fontWeight(line.kind == "translation" ? .semibold : .regular)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(6)
-        }
-        .frame(minWidth: 560, minHeight: 140, maxHeight: 140)
-        .border(Color.gray.opacity(0.3))
     }
 
     private var sourcePicker: some View {
@@ -196,7 +178,11 @@ struct ContentView: View {
                 Text("Running (pid \(pid))").foregroundStyle(.green)
             }
         case .failed(let message):
-            Text(message).foregroundStyle(.red)
+            Text(message)
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
         }
     }
 
@@ -215,17 +201,14 @@ struct ContentView: View {
     }
 
     private func linkBlock(url: String) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(url)
-                    .font(.system(.body, design: .monospaced))
-                Button("Copy Link") {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(url, forType: .string)
-                }
+        VStack(alignment: .leading, spacing: 6) {
+            Text(url)
+                .font(.system(.body, design: .monospaced))
+            Button("Copy Link") {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(url, forType: .string)
             }
-            QRCodeView(string: url)
         }
     }
 
@@ -247,7 +230,10 @@ struct ContentView: View {
             .disabled(isRunning || isLoadingTunnels)
 
             if tunnels.isEmpty, !isLoadingTunnels {
-                Text("No runnable tunnels found on this Mac").font(.caption).foregroundStyle(.secondary)
+                Text("No runnable tunnels found on this Mac")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -267,7 +253,10 @@ struct ContentView: View {
                 .disabled(isRunning)
             }
             if let outlineError {
-                Text(outlineError).foregroundStyle(.red).font(.caption)
+                Text(outlineError)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .fileImporter(
