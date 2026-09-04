@@ -77,13 +77,27 @@ REGISTER_BY_TARGET = {
 # translates them naturally without hints. This table is for proper nouns and
 # address-form overrides specific to a direction pair.
 #
-# The church's official name and the pastor's name are church-specific and not
-# hardcoded here — they come from CHURCH_NAME_KO/CHURCH_NAME_EN and
-# PASTOR_NAME_KO/PASTOR_NAME_EN (env vars, e.g. via .env), so any church can
-# configure their own without a code change. Without them, Claude just
-# translates those words naturally (which may render a name literally, e.g.
-# "Stump Church" — set the church name vars to fix that for churches with a
-# name that isn't a literal translation between languages).
+# The church's official name and the pastor's name come from CHURCH_NAME_KO/
+# CHURCH_NAME_EN and PASTOR_NAME_KO/PASTOR_NAME_EN (env vars, e.g. via .env).
+# Any *additional* terms (other staff, ministries, buildings — anything with a
+# non-literal official translation) come from CUSTOM_TERMS: a JSON array of
+# {"ko": ..., "en": ..., "es": ...} objects (any subset of languages per
+# entry), managed from the app's Settings window so adding one never requires
+# a code change. Without any of these set, Claude just translates the words
+# naturally (which may render a name literally, e.g. "Stump Church").
+def _parse_custom_terms() -> list[dict]:
+    raw = os.environ.get("CUSTOM_TERMS", "").strip()
+    if not raw:
+        return []
+    try:
+        terms = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(terms, list):
+        return []
+    return [t for t in terms if isinstance(t, dict)]
+
+
 def _term_prefs(source: str, target: str) -> str:
     name_ko = os.environ.get("CHURCH_NAME_KO", "").strip()
     name_en = os.environ.get("CHURCH_NAME_EN", "").strip()
@@ -91,12 +105,7 @@ def _term_prefs(source: str, target: str) -> str:
     pastor_en = os.environ.get("PASTOR_NAME_EN", "").strip()
     have_church = bool(name_ko and name_en)
     have_pastor = bool(pastor_ko and pastor_en)
-
-    church_to_en = (
-        f'{name_ko} → {name_en} (the church\'s official English name — '
-        "never render it literally)"
-    ) if have_church else ""
-    church_to_ko = f"{name_en} → {name_ko}" if have_church else ""
+    custom_terms = _parse_custom_terms()
 
     # ko/multi → en/es: 정목사-style pastor hint only applies here since a
     # Korean honorific never appears in en/es source speech.
@@ -107,13 +116,30 @@ def _term_prefs(source: str, target: str) -> str:
             parts.append(f"{pastor_ko} → {pastor_en}")
         if target == "en" and have_church:
             # No official Spanish church name, so es targets translate it naturally.
-            parts.append(church_to_en)
+            parts.append(
+                f'{name_ko} → {name_en} (the church\'s official English name — '
+                "never render it literally)"
+            )
+        for t in custom_terms:
+            ko = str(t.get("ko", "")).strip()
+            tgt_val = str(t.get(target, "")).strip()
+            if ko and tgt_val:
+                parts.append(f"{ko} → {tgt_val}")
         return "; ".join(parts) + "."
 
     # Anything targeting ko (including ko → ko passthrough) gets the reverse
-    # church-name hint, regardless of source.
+    # hints, regardless of source — matches the church name's existing
+    # always-English-anchored direction rather than adding an es→ko path.
     if target == "ko":
-        return f"{church_to_ko}." if have_church else ""
+        parts = []
+        if have_church:
+            parts.append(f"{name_en} → {name_ko}")
+        for t in custom_terms:
+            ko = str(t.get("ko", "")).strip()
+            en = str(t.get("en", "")).strip()
+            if ko and en:
+                parts.append(f"{en} → {ko}")
+        return "; ".join(parts) + "." if parts else ""
 
     return ""
 
