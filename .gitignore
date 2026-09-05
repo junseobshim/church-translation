@@ -25,3 +25,16 @@ worker/.wrangler/
 
 # Apps (for one click launch)
 *.app
+
+# Swift package build artifacts + staged Python runtime (app/build/stage_python.sh output)
+app/.build/
+app/.build-cache/
+app/Resources/
+app/build/*.dmg
+app/build/.dmg-staging/
+# Stray swiftc intermediates that sometimes land at app/ root instead of
+# .build/ when incremental compilation gets confused (harmless, regenerable).
+app/*.d
+app/*.o
+app/*.swiftdeps
+app/*.swiftdeps~

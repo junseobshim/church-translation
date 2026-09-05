@@ -77,32 +77,71 @@ REGISTER_BY_TARGET = {
 # translates them naturally without hints. This table is for proper nouns and
 # address-form overrides specific to a direction pair.
 #
-# 그루터기 교회 / Remnant Church is the church's official name in each language,
-# not a translation of the other — without the hint Claude renders it literally
-# ("Stump Church"). There is no official Spanish name, so es targets are left to
-# translate it naturally.
-CHURCH_TO_EN = ('그루터기 교회 → Remnant Church (the church\'s official English '
-                'name — never render it literally, e.g. "Stump Church")')
-CHURCH_TO_KO = "Remnant Church → 그루터기 교회"
+# The church's official name and the pastor's name come from CHURCH_NAME_KO/
+# CHURCH_NAME_EN and PASTOR_NAME_KO/PASTOR_NAME_EN (env vars, e.g. via .env).
+# Any *additional* terms (other staff, ministries, buildings — anything with a
+# non-literal official translation) come from CUSTOM_TERMS: a JSON array of
+# {"ko": ..., "en": ..., "es": ...} objects (any subset of languages per
+# entry), managed from the app's Settings window so adding one never requires
+# a code change. Without any of these set, Claude just translates the words
+# naturally (which may render a name literally, e.g. "Stump Church").
+def _parse_custom_terms() -> list[dict]:
+    raw = os.environ.get("CUSTOM_TERMS", "").strip()
+    if not raw:
+        return []
+    try:
+        terms = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(terms, list):
+        return []
+    return [t for t in terms if isinstance(t, dict)]
 
-TERM_PREFS_BY_PAIR = {
-    ("ko", "en"):    f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
-    ("ko", "es"):    "여러분 → todos; 정목사 → Pastor Chung.",
-    ("en", "ko"):    f"{CHURCH_TO_KO}.",
-    ("en", "es"):    "",
-    ("es", "en"):    "",
-    ("es", "ko"):    f"{CHURCH_TO_KO}.",
-    # Same-language targets: a bilingual source (ko+en or es+en) may also select
-    # its base language as a target, so matching segments pass through unchanged
-    # and only overrides for the source's *other* language apply. --source en is
-    # pure English and never targets en, so there is no (en, en) entry.
-    ("ko", "ko"):    f"{CHURCH_TO_KO}.",
-    ("es", "es"):    "",
-    # multi → any: use ko-specific prefs since 정목사 only appears in Korean speech.
-    ("multi", "en"): f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
-    ("multi", "es"): "여러분 → todos; 정목사 → Pastor Chung.",
-    ("multi", "ko"): f"{CHURCH_TO_KO}.",
-}
+
+def _term_prefs(source: str, target: str) -> str:
+    name_ko = os.environ.get("CHURCH_NAME_KO", "").strip()
+    name_en = os.environ.get("CHURCH_NAME_EN", "").strip()
+    pastor_ko = os.environ.get("PASTOR_NAME_KO", "").strip()
+    pastor_en = os.environ.get("PASTOR_NAME_EN", "").strip()
+    have_church = bool(name_ko and name_en)
+    have_pastor = bool(pastor_ko and pastor_en)
+    custom_terms = _parse_custom_terms()
+
+    # ko/multi → en/es: 정목사-style pastor hint only applies here since a
+    # Korean honorific never appears in en/es source speech.
+    if source in ("ko", "multi") and target in ("en", "es"):
+        everyone = "everyone" if target == "en" else "todos"
+        parts = [f"여러분 → {everyone}"]
+        if have_pastor:
+            parts.append(f"{pastor_ko} → {pastor_en}")
+        if target == "en" and have_church:
+            # No official Spanish church name, so es targets translate it naturally.
+            parts.append(
+                f'{name_ko} → {name_en} (the church\'s official English name — '
+                "never render it literally)"
+            )
+        for t in custom_terms:
+            ko = str(t.get("ko", "")).strip()
+            tgt_val = str(t.get(target, "")).strip()
+            if ko and tgt_val:
+                parts.append(f"{ko} → {tgt_val}")
+        return "; ".join(parts) + "."
+
+    # Anything targeting ko (including ko → ko passthrough) gets the reverse
+    # hints, regardless of source — matches the church name's existing
+    # always-English-anchored direction rather than adding an es→ko path.
+    if target == "ko":
+        parts = []
+        if have_church:
+            parts.append(f"{name_en} → {name_ko}")
+        for t in custom_terms:
+            ko = str(t.get("ko", "")).strip()
+            en = str(t.get("en", "")).strip()
+            if ko and en:
+                parts.append(f"{en} → {ko}")
+        return "; ".join(parts) + "." if parts else ""
+
+    return ""
 
 SOURCE_COMPOSITION = {
     "ko":    "Korean (with occasional English)",
@@ -158,7 +197,7 @@ def build_prompt(source: str, target: str) -> str:
         f"Translate segments in other languages into {tname}, even if they repeat "
         "or paraphrase already-translated content — always include both."
     )
-    prefs = TERM_PREFS_BY_PAIR[(source, target)]
+    prefs = _term_prefs(source, target)
     prefs_clause = f"Preferred terms: {prefs} " if prefs else ""
     return (
         f"You are a live translation assistant for a {SOURCE_COMPOSITION[source]} church sermon. "

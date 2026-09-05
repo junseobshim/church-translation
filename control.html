@@ -912,11 +912,13 @@
       if (!r.ok) throw new Error();
       const devices = await r.json();
       sel.innerHTML = '';
-      // Every church interface is a Focusrite Scarlett, so preselect the first
-      // one to save the operator a step. Falls back to the first device when no
-      // Scarlett is plugged in. The operator still confirms before starting.
-      const scarlett = devices.findIndex(d => /scarlett/i.test(d.name));
-      const preselect = scarlett === -1 ? 0 : scarlett;
+      // Preselect whichever interface this operator used last time, regardless
+      // of brand, to save a step. Falls back to the first device on first run
+      // or if that device is unplugged. The operator still confirms before
+      // starting.
+      const lastDevice = localStorage.getItem('lastAudioDevice') || '';
+      const remembered = devices.findIndex(d => d.name === lastDevice);
+      const preselect = remembered === -1 ? 0 : remembered;
       devices.forEach((d, i) => {
         const opt = document.createElement('option');
         opt.value = d.index;
@@ -933,6 +935,8 @@
 
   document.getElementById('deviceSelect').addEventListener('change', function() {
     deviceIndex = this.value || null;
+    const name = this.options[this.selectedIndex]?.textContent;
+    if (name) localStorage.setItem('lastAudioDevice', name);
     updateCmd();
   });
 
