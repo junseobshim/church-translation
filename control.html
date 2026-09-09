@@ -583,6 +583,19 @@
     display: none;
   }
 
+  /* Same shape as .error-banner but amber: a degraded session, not a failed
+     one — translation still works, it's just paying full price per phrase. */
+  .warn-banner {
+    background: var(--amber-dim);
+    border: 1px solid rgba(245,166,35,0.3);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--amber);
+    display: none;
+  }
+
 </style>
 </head>
 <body>
@@ -590,7 +603,7 @@
 <header>
   <div class="logo-mark">🎙</div>
   <h1>Live Translation</h1>
-  <p class="subtitle">Volunteer control panel · RC Church</p>
+  <p class="subtitle">Operator control panel · Remnant Church</p>
 </header>
 
 <div class="panel">
@@ -686,7 +699,7 @@
 
       <div style="margin-bottom:16px">
         <div class="toggle-label">Cloudflare tunnel</div>
-        <div class="toggle-sub" id="tunnelSub" style="margin-bottom:8px">Enables phone access</div>
+        <div class="toggle-sub" id="tunnelSub" style="margin-bottom:8px">Enable internet access</div>
         <select class="device-select" id="tunnelSelect" style="width:100%">
           <option value="">Loading…</option>
         </select>
@@ -717,13 +730,11 @@
 
       <!-- Fallback textarea -->
       <div style="margin-top:10px;font-size:12px;color:var(--muted);margin-bottom:6px" id="outlinePasteLabel">Or paste outline text directly:</div>
-      <textarea class="outline-input" id="outlineText" placeholder="Paste sermon outline here for better translation accuracy…"></textarea>
-
-      <div style="font-size:12px;color:var(--muted);margin-top:8px">
-        Helps Claude stay on topic. Does not restrict translation — spoken words always take priority.
-      </div>
+      <textarea class="outline-input" id="outlineText" placeholder="Helps Claude stay on topic. Does not restrict translation — spoken words always take priority."></textarea>
     </div>
   </div>
+
+  <div class="warn-banner" id="cacheWarning"></div>
 
   <!-- Command preview -->
   <div id="cmdPreviewWrap">
@@ -889,11 +900,11 @@
     const url = selectedTunnelUrl();
     if (!selectedTunnel()) {
       sub.textContent = tunnels.length
-        ? 'Phones will not be able to connect'
+        ? 'Viewers will not be able to connect over the internet'
         : '⚠ No tunnels found on this device';
     } else {
       sub.textContent = url
-        ? `Enables phone access via ${url.replace(/^https:\/\//, '')}`
+        ? `Enable internet access via ${url.replace(/^https:\/\//, '')}`
         : '⚠ No public URL mapped for this tunnel (see tunnels.json)';
     }
   }
@@ -1063,6 +1074,50 @@
     setTimeout(() => b.style.display = 'none', 6000);
   }
 
+  // ── Prompt-cache check ──────────────────────────────────────────────
+  // A cache that was asked for but never written is invisible from inside the
+  // session — the API ignores cache_control on a prefix below the model's
+  // minimum length and returns no error, so the run just silently pays full
+  // price on every phrase. main.py measures what was actually written and
+  // publishes it on /api/config; this only warns when an outline was supplied,
+  // since that is the only case where a cache was expected at all.
+  // Warming happens after the caption server is already listening, so `cache`
+  // is briefly empty on a fresh start — hence the retry. The budget is
+  // generous because /api/start returns as soon as main.py is spawned, and
+  // warmup runs one sequential call per target after imports, device probe
+  // and tunnel startup; three targets on a slow link can take well over a
+  // minute to publish.
+  const CACHE_CHECK_TRIES = 40, CACHE_CHECK_MS = 2000;
+  async function checkCacheStatus(attempt) {
+    attempt = attempt || 0;
+    const retry = () => {
+      if (running && attempt < CACHE_CHECK_TRIES) {
+        setTimeout(() => checkCacheStatus(attempt + 1), CACHE_CHECK_MS);
+      }
+    };
+    let entries;
+    try {
+      const r = await fetch('/api/config', { cache: 'no-store' });
+      if (!r.ok) throw new Error('bad status');
+      entries = (await r.json()).cache;
+    } catch(e) {
+      return retry();
+    }
+    if (!Array.isArray(entries) || !entries.length) return retry();
+
+    const names = entries
+      .filter(e => e.requested && !e.cached)
+      .map(e => ({en:'English',ko:'Korean',es:'Spanish'}[e.target] || e.target));
+    if (!names.length) return;
+
+    const b = document.getElementById('cacheWarning');
+    b.textContent = '⚠ Outline loaded, but prompt caching is not active for '
+      + names.join(', ') + '. The outline is too short to cache on this model, so '
+      + 'it is re-sent in full with every phrase. Translation still works — it '
+      + 'just costs more. A longer outline will cache.';
+    b.style.display = 'block';
+  }
+
   // ── Timer ──────────────────────────────────────────────────────────────────
   function startTimer() {
     startTime = Date.now();
@@ -1127,22 +1182,37 @@
     const localBase = `http://localhost:${port}`;
     const links = [];
 
-    // Experimental two-slot mode: multilingual services only, where all three
-    // languages run. Each box shows one of the two languages NOT currently
-    // being spoken — slot 1 is Korean, slot 2 is Spanish, and English backfills
-    // whichever box's home language the speaker switches into. Point one
-    // ProPresenter web-fill text box at each.
-    if (source === 'multi') {
+    // Experimental slot mode: each box shows one of the languages NOT currently
+    // being spoken. It only holds together when every language that *can* be
+    // spoken is also a target — otherwise a phrase in an untargeted language
+    // leaves nothing to route, and the boxes blank out or swap languages
+    // mid-service. That's the mirror test below. Multi always mirrors (its
+    // targets are locked to all three); ko/es mirror only when their own
+    // language plus English is the exact target set; English-only source can
+    // never mirror, since en cannot target en.
+    const SPOKEN_LANGS = {
+      ko: ['ko', 'en'], es: ['es', 'en'], en: ['en'], multi: ['ko', 'en', 'es'],
+    }[source] || [];
+    const mirrors = SPOKEN_LANGS.length === targets.size &&
+                    SPOKEN_LANGS.every(l => targets.has(l));
+    if (mirrors) {
       const slotOpts = 'display=paragraph&fontSize=96&fontWeight=500' +
                        '&lineSpacing=1.3&bgColor=transparent&hideStatus=1';
-      [
-        { slot: 1, home: 'Korean' },
-        { slot: 2, home: 'Spanish' },
-      ].forEach(({ slot, home }) => {
+      // Same pool the viewer derives: priority order filtered to the targets.
+      // Must stay in step with DEFAULT_SLOT_PRIORITY in static/viewer.js.
+      const pool = ['ko', 'en', 'es'].filter(l => targets.has(l));
+      const name = l => ({ en: 'English', ko: 'Korean', es: 'Spanish' })[l];
+      // N languages in play leave N-1 to display. Trilingual fills two boxes,
+      // each with a home language the third backfills; bilingual fills one box
+      // that just alternates between the two, so it has no home to name.
+      const labels = pool.length === 3
+        ? [`${name(pool[0])} home`, `${name(pool[2])} home`]
+        : [`${name(pool[0])} ⇄ ${name(pool[1])}`];
+      labels.forEach((label, i) => {
         links.push({
           icon: '🔀',
-          name: `Slot ${slot} · ${home} home`,
-          url: `${localBase}/?mode=translation&slot=${slot}&${slotOpts}`,
+          name: `Slot ${i + 1} · ${label}`,
+          url: `${localBase}/?mode=translation&slot=${i + 1}&${slotOpts}`,
           sub: 'ProPresenter web fill (experimental)',
         });
       });
@@ -1198,6 +1268,7 @@
       document.getElementById('mainBtn').textContent = 'Start Translation';
       document.getElementById('previewCard').style.display = 'none';
       document.getElementById('linksSection').style.display = 'none';
+      document.getElementById('cacheWarning').style.display = 'none';
       setStatus('ready', 'Session stopped', 'Close tab when done');
       return;
     }
@@ -1245,6 +1316,8 @@
       buildLinks();
       startTimer();
       startPoll();
+      document.getElementById('cacheWarning').style.display = 'none';
+      checkCacheStatus();
       const targetNames = [...targets].map(t => ({en:'English',ko:'Korean',es:'Spanish'}[t])).join(' + ');
       setStatus('running', `Live · ${({ko:'Korean',en:'English',es:'Spanish',multi:'Multi'}[source])} → ${targetNames}`);
     } catch(e) {

@@ -30,6 +30,13 @@ from typing import Optional, List, Dict
 _session_proc: Optional[subprocess.Popen] = None
 _session_lock = threading.Lock()
 _outline_temp: Optional[tempfile.NamedTemporaryFile] = None
+# Port the running session serves captions on — the operator can change it in
+# the panel's Advanced options. Set from the /api/start payload and used both
+# to build main.py's --port flag and to aim the read-only proxies below, so
+# the panel's own preview and cache check can never end up pointed at a
+# different port than the session is listening on. Survives a stop so a
+# restart on the same port keeps working.
+_caption_port: int = 8080
 
 # Heartbeat — set to current time whenever /api/heartbeat is called.
 _last_heartbeat: float = 0.0
@@ -150,7 +157,7 @@ def build_command(payload: dict, outline_path: Optional[str]) -> list[str]:
     cmd += ["--target", ",".join(payload["targets"])]
     if payload.get("device") is not None:
         cmd += ["--device", str(payload["device"])]
-    cmd += ["--port", str(payload.get("port", 8080))]
+    cmd += ["--port", str(_caption_port)]
     # `tunnel` is a tunnel name, or null/false for no tunnel. Older clients sent
     # a bare boolean, where true meant main.py's default tunnel.
     tunnel = payload.get("tunnel", True)
@@ -207,7 +214,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 
     # ── /api/start ─────────────────────────────────────────────────────────────
     def _handle_start(self):
-        global _session_proc, _outline_temp
+        global _session_proc, _outline_temp, _caption_port
 
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -216,6 +223,14 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._json(400, {"error": "Invalid JSON"})
             return
+
+        # Anything unusable falls back to the default rather than failing the
+        # start — a bad port would otherwise take down the whole session over
+        # a field most operators never touch.
+        try:
+            _caption_port = int(payload.get("port", 8080))
+        except (TypeError, ValueError):
+            _caption_port = 8080
 
         with _session_lock:
             if _session_proc and _session_proc.poll() is None:
@@ -318,15 +333,19 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 
         threading.Thread(target=_pending_shutdown, daemon=True).start()
 
-    def _proxy_latest(self):
-        """Proxy /api/latest to the caption server port."""
+    def _proxy_caption(self, path: str, fallback: dict):
+        """Proxy a read-only caption-server endpoint through to the panel.
+
+        `fallback` is served with a 503 when the caption server isn't up yet
+        (or is between sessions), so the panel's poll loops see a well-shaped
+        empty response instead of a parse error.
+        """
         import urllib.request
         import urllib.error
 
-        caption_port = 8080  # default; could be stored from last start payload
         try:
             with urllib.request.urlopen(
-                f"http://localhost:{caption_port}/api/latest", timeout=1
+                f"http://localhost:{_caption_port}{path}", timeout=1
             ) as r:
                 data = r.read()
                 self.send_response(200)
@@ -336,7 +355,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
         except Exception:
-            self._json(503, {"lines": [], "updated": 0})
+            self._json(503, fallback)
 
     # ── JSON helper ────────────────────────────────────────────────────────────
     def _json(self, status: int, data):
@@ -361,7 +380,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/status":
                 self._serve_status()
             elif path == "/api/latest":
-                self._proxy_latest()
+                self._proxy_caption("/api/latest", {"lines": [], "updated": 0})
+            elif path == "/api/config":
+                self._proxy_caption("/api/config", {"targets": [], "cache": []})
             elif path == "/api/heartbeat":
                 self._handle_heartbeat()
             else:

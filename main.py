@@ -93,10 +93,12 @@ def dominant_lang(weights: dict[str, int], fallback: str) -> str:
 
 # ── Prompt pieces (Claude zone) ───────────────────────────────────────────────
 
+# Just the language plus its examples — the prompt supplies "hesitation
+# fillers" once, ahead of the list, rather than once per language.
 FILLER_CLAUSE_BY_LANG = {
-    "ko": "Korean hesitation fillers (아, 어)",
-    "en": "English hesitation fillers (uh, um, like, you know, so, I mean)",
-    "es": "Spanish hesitation fillers (eh, este, pues, o sea, bueno)",
+    "ko": "Korean (아, 어)",
+    "en": "English (uh, um, like, you know, so, I mean)",
+    "es": "Spanish (eh, este, pues, o sea, bueno)",
 }
 
 BIBLE_BY_TARGET = {
@@ -111,6 +113,19 @@ REGISTER_BY_TARGET = {
     "es": "",
 }
 
+# Added 2026-09-09. The sanctuary screens fit a limited number of characters, so
+# a shorter rendering is preferred — but strictly as a tie-breaker among
+# renderings that are already equally faithful, never as a reason to compress.
+# Phrased as a property of the single output rather than a choice between two,
+# since the model only ever emits one. Documented in README "Translation
+# pipeline" so it can be lifted out cleanly: delete this constant and its use in
+# build_prompt if testing shows it trading accuracy for brevity.
+CONCISION_CLAUSE = (
+    "Display space is limited: prefer the shortest rendering that preserves "
+    "the full meaning and context. Never trade accuracy, context or "
+    "literalness for brevity. "
+)
+
 # Proper-noun / address preferences, keyed by (source, target).
 # Religious nouns (하나님, Dios, etc.) live in the Soniox terms list; Claude
 # translates them naturally without hints. This table is for proper nouns and
@@ -124,24 +139,45 @@ CHURCH_TO_EN = ('그루터기 교회 → Remnant Church (the church\'s official 
                 'name — never render it literally, e.g. "Stump Church")')
 CHURCH_TO_KO = "Remnant Church → 그루터기 교회"
 
+# The pastor is 정목사 in Korean and Pastor Joe in both English and Spanish, so
+# one English-side form serves en and es targets. Mapped in both directions:
+# a Korean source needs 정목사 → Pastor Joe, and every ko target needs the
+# reverse — every source can carry English speech (SOURCE_LANGS has "en" in all
+# four), so without it a spoken "Pastor Joe" reaches Korean readers as-is.
+PASTOR_TO_EN = "정목사 → Pastor Joe"
+PASTOR_TO_KO = "Pastor Joe → 정목사"
+
 TERM_PREFS_BY_PAIR = {
-    ("ko", "en"):    f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
-    ("ko", "es"):    "여러분 → todos; 정목사 → Pastor Chung.",
-    ("en", "ko"):    f"{CHURCH_TO_KO}.",
+    ("ko", "en"):    f"여러분 → everyone; {PASTOR_TO_EN}; {CHURCH_TO_EN}.",
+    ("ko", "es"):    f"여러분 → todos; {PASTOR_TO_EN}.",
+    ("en", "ko"):    f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
     ("en", "es"):    "",
     ("es", "en"):    "",
-    ("es", "ko"):    f"{CHURCH_TO_KO}.",
+    ("es", "ko"):    f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
     # Same-language targets: a bilingual source (ko+en or es+en) may also select
     # its base language as a target, so matching segments pass through unchanged
     # and only overrides for the source's *other* language apply. --source en is
     # pure English and never targets en, so there is no (en, en) entry.
-    ("ko", "ko"):    f"{CHURCH_TO_KO}.",
+    ("ko", "ko"):    f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
     ("es", "es"):    "",
-    # multi → any: use ko-specific prefs since 정목사 only appears in Korean speech.
-    ("multi", "en"): f"여러분 → everyone; 정목사 → Pastor Chung; {CHURCH_TO_EN}.",
-    ("multi", "es"): "여러분 → todos; 정목사 → Pastor Chung.",
-    ("multi", "ko"): f"{CHURCH_TO_KO}.",
+    # multi → any: 정목사 only appears in Korean speech, so en/es targets take
+    # the ko-side prefs; a ko target needs the reverse, since the same service
+    # can carry English speech naming the pastor and the church.
+    ("multi", "en"): f"여러분 → everyone; {PASTOR_TO_EN}; {CHURCH_TO_EN}.",
+    ("multi", "es"): f"여러분 → todos; {PASTOR_TO_EN}.",
+    ("multi", "ko"): f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
 }
+
+def _article(phrase: str) -> str:
+    """"a" or "an" for the phrase that follows.
+
+    A vowel-letter test is enough for SOURCE_COMPOSITION's values ("English"
+    is the only one needing "an"). It would be wrong for a word whose spelling
+    and sound disagree — "a European", "an hour" — so revisit if one is ever
+    added.
+    """
+    return "an" if phrase[:1].lower() in "aeiou" else "a"
+
 
 SOURCE_COMPOSITION = {
     "ko":    "Korean (with occasional English)",
@@ -184,13 +220,21 @@ def load_outline(path: str) -> str:
     return text.strip()
 
 
-def build_prompt(source: str, target: str) -> str:
+def build_prompt(source: str, target: str, forceable: bool = False) -> str:
     """Assemble the live-translation system prompt for a (source, target) pair.
 
     Composed from piece dicts above — no per-combo hardcoded strings.
+
+    `forceable` is set for slot-mode sessions, where TranslationWorker may
+    re-send a [SKIP]ped fragment with a directive to translate it anyway. The
+    unconditional promise that skipped fragments are prepended to the next
+    phrase is false in that case, and leaving it in would put the directive in
+    direct conflict with the system prompt. Off for every other session, so
+    the ordinary path's prompt — and its cache entry — stay untouched.
     """
+    composition = SOURCE_COMPOSITION[source]
     langs_present = SOURCE_LANGS[source]
-    fillers = " and ".join(FILLER_CLAUSE_BY_LANG[l] for l in langs_present)
+    fillers = ", ".join(FILLER_CLAUSE_BY_LANG[l] for l in langs_present)
     tname = LANG_NAMES[target]
     same_lang_clause = (
         f"For segments already in {tname}, keep them unchanged. "
@@ -199,19 +243,30 @@ def build_prompt(source: str, target: str) -> str:
     )
     prefs = TERM_PREFS_BY_PAIR[(source, target)]
     prefs_clause = f"Preferred terms: {prefs} " if prefs else ""
+    skip_clause = (
+        "If the fragment is too incomplete or garbled, output exactly: [SKIP] "
+        "Short fragments that lack a verb or predicate and cannot stand alone as a "
+        "meaningful sentence should be [SKIP]ped — they will "
+        + ("usually be prepended to the next phrase automatically. Occasionally a phrase "
+           "arrives marked as non-continuable, because the speaker changed language and "
+           "nothing further will complete it; translate that one as it stands, however "
+           "incomplete, rather than answering [SKIP]. "
+           if forceable else
+           "be prepended to the next phrase automatically. ")
+    )
     return (
-        f"You are a live translation assistant for a {SOURCE_COMPOSITION[source]} church sermon. "
+        f"You are a live translation assistant for {_article(composition)} "
+        f"{composition} church sermon. "
         "You receive a rolling context window of recent phrases; prior translations are provided as context. "
-        f"Translate ONLY the latest phrase into {tname}. "
-        f"Drop hesitation fillers like {fillers}. "
+        f"Translate ONLY the latest input into {tname}. "
+        f"Drop hesitation fillers: {fillers}. "
         f"{same_lang_clause} "
         f"{prefs_clause}"
         "Output ONLY the translation — no commentary, notes, or language code prefix. "
+        f"{CONCISION_CLAUSE}"
         "Phrases may arrive as incomplete clauses. Translate only the words present — "
         "never infer or complete missing verbs or conclusions. "
-        "If the fragment is too incomplete or garbled, output exactly: [SKIP] "
-        "Short fragments that lack a verb or predicate and cannot stand alone as a meaningful sentence "
-        "should be [SKIP]ped — they will be prepended to the next phrase automatically. "
+        f"{skip_clause}"
         f"When quoting or referencing Bible passages, use the {BIBLE_BY_TARGET[target]} for {tname}."
         f"{REGISTER_BY_TARGET[target]}"
     )
@@ -231,6 +286,12 @@ _default_target_lang = "en"  # set in main() from the first --target
 # UI can validate a visitor's saved language against what's actually running.
 _current_source = "ko"
 _current_targets: list[str] = []
+# Per-target prompt-cache outcome, filled in by _record_cache_status() after
+# warmup and exposed on the same endpoint. A cache that was requested but
+# never written is invisible from inside the session — the API ignores
+# cache_control on a too-short prefix without erroring — so the control panel
+# surfaces it from here.
+_cache_status: list[dict] = []
 
 
 def _encode_web_state() -> bytes:
@@ -280,6 +341,7 @@ def _get_config_json() -> bytes:
         "source": _current_source,
         "targets": _current_targets,
         "default_target": _default_target_lang,
+        "cache": _cache_status,
     }).encode()
 
 
@@ -502,7 +564,8 @@ class TranslationWorker:
     """
 
     def __init__(self, backend, source: str, stop_event: threading.Event,
-                 on_translation: Callable[[str, str, str], None]):
+                 on_translation: Callable[[str, str, str], None],
+                 split_on_lang_change: bool = False):
         self.backend = backend
         self.source = source
         self.stop_event = stop_event
@@ -513,14 +576,20 @@ class TranslationWorker:
         # Language weights carried by pending_text, so a [SKIP]ped fragment
         # still counts toward the source language of whatever it lands in.
         self.pending_weights: dict[str, int] = {}
+        # Dominant language of pending_text. Only consulted in slot mode, to
+        # notice when the held fragment is about to merge into speech in a
+        # different language — see _flush_pending.
+        self.pending_lang: Optional[str] = None
         # One phrase pulled off the inbox but held back because it starts a new
         # spoken language — see _run. Only ever touched by the worker thread.
         self._held: Optional[tuple[str, str]] = None
-        # Coalescing across a language change would produce one output covering
-        # two spoken languages, which the two-slot caption mode cannot route
-        # (it drops a line whose target equals the spoken language). Only multi
-        # feeds that mode, so only multi pays the extra round trip at switches.
-        self.split_on_lang_change = source == "multi"
+        # Coalescing across a language change produces one output covering two
+        # spoken languages, which the two-slot caption mode cannot route (it
+        # drops a line whose target equals the spoken language). Splitting
+        # costs an extra round trip at every switch inside a backlog, so it is
+        # only worth paying when a viewer could actually be in slot mode —
+        # see slot_mode_available(), which _build_workers evaluates once.
+        self.split_on_lang_change = split_on_lang_change
         self._run_thread: Optional[threading.Thread] = None
 
     def warm(self) -> None:
@@ -542,6 +611,48 @@ class TranslationWorker:
         if block:
             return self.inbox.get(timeout=0.25)
         return self.inbox.get_nowait()
+
+    def _flush_pending(self) -> None:
+        """Translate the held fragment alone, before it can merge across a
+        language boundary.
+
+        pending_text is filled by two paths — a [SKIP] and a failed API call —
+        and both are bets that the *next* phrase will complete the fragment.
+        That bet is off once the speaker changes language: merging then yields
+        one output line covering two spoken languages, and slot routing has
+        only N-1 boxes for N languages' worth of content, so one target's line
+        is dropped and its readers lose the fragment entirely.
+
+        `force` tells the backend not to answer [SKIP] — re-asking without it
+        would almost certainly skip again, since the input and the rolling
+        context are unchanged from the call that skipped in the first place.
+        If it skips anyway, or the call fails, pending is left untouched and
+        the caller falls through to the ordinary merge.
+        """
+        text, lang = self.pending_text, self.pending_lang
+        try:
+            out = self.backend.translate(self.context, text, force=True)
+        except Exception as e:
+            print(f"[{self.backend.target} flush error: {e}]", file=sys.stderr)
+            self.backend.mark_activity()
+            return
+        if "[SKIP]" in out:
+            # Refused the directive. Harmless — the caller falls back to the
+            # ordinary merge — but it cost a round trip and the merged line
+            # will lose one target's caption, so it is worth seeing in the log
+            # if it turns out to be common.
+            print(f"[{self.backend.target} forced flush still skipped]",
+                  file=sys.stderr)
+            return
+        self.pending_text = ""
+        self.pending_weights = {}
+        self.pending_lang = None
+        self.context.append((text, out))
+        if len(self.context) > 5:
+            self.context.pop(0)
+        prefixed = f"[{self.backend.target}] {out}"
+        print(f"[Translation:{self.backend.target} flush] {prefixed}")
+        self.on_translation(self.backend.target, prefixed, lang)
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -565,6 +676,15 @@ class TranslationWorker:
                     self._held = nxt  # starts a new spoken language — next call
                     break
                 batch.append(nxt)
+            # Slot mode only: a pending fragment about to merge into another
+            # language gets translated on its own first. Outside slot mode
+            # nothing reads the src label, so the merge is harmless and this
+            # never fires — the [SKIP] and coalescing paths behave exactly as
+            # they did before. `batch` is single-language whenever splitting
+            # is on, so batch[-1][0] is the whole batch's language.
+            if (self.split_on_lang_change and self.pending_text
+                    and self.pending_lang != batch[-1][0]):
+                self._flush_pending()
             weights = dict(self.pending_weights)
             parts = []
             for lang, text in batch:
@@ -587,6 +707,7 @@ class TranslationWorker:
                 # whole backlog of speech on a transient API error.
                 self.pending_text = combined
                 self.pending_weights = weights
+                self.pending_lang = src_lang
                 continue
             if len(batch) > 1:
                 print(f"[worker {self.backend.target}: coalesced={len(batch)}]",
@@ -594,9 +715,11 @@ class TranslationWorker:
             if "[SKIP]" in out:
                 self.pending_text = combined
                 self.pending_weights = weights
+                self.pending_lang = src_lang
                 continue
             self.pending_text = ""
             self.pending_weights = {}
+            self.pending_lang = None
             self.context.append((combined, out))
             if len(self.context) > 5:
                 self.context.pop(0)
@@ -608,24 +731,68 @@ class TranslationWorker:
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 
+def slot_mode_available(source: str, targets: list[str]) -> bool:
+    """True when every language the source can speak is also a target.
+
+    That is exactly what the two-slot viewer needs: a phrase in a language
+    nobody translates into has no line to route, so a box would blank out or
+    swap languages mid-service. Nothing else can use the `src` label, so when
+    this is False the batcher is free to coalesce across a language change.
+
+    SOURCE_LANGS is the single source of truth here; control.html carries its
+    own copy as SPOKEN_LANGS to gate the slot links, and the two must agree.
+    """
+    return set(SOURCE_LANGS.get(source, ())) == set(targets)
+
+
 def _build_workers(client, source: str, targets: list[str],
                    outline: Optional[str], stop_event: threading.Event,
                    model: str, backend_cls) -> list[TranslationWorker]:
     """Construct one TranslationWorker per target. Per-worker cache eligibility
     is decided independently inside backend_cls.from_outline."""
     workers: list[TranslationWorker] = []
+    split = slot_mode_available(source, targets)
     for t in targets:
-        backend = backend_cls.from_outline(client, source, t, outline, model)
+        backend = backend_cls.from_outline(client, source, t, outline, model,
+                                           forceable=split)
         w = TranslationWorker(
             backend=backend,
             source=source,
             stop_event=stop_event,
+            split_on_lang_change=split,
             on_translation=lambda tgt, txt, src: _push_to_web(
                 "translation", txt, fallback_lang=tgt, src=src
             ),
         )
         workers.append(w)
     return workers
+
+
+def _record_cache_status(workers: list["TranslationWorker"]) -> None:
+    """Publish each worker's post-warmup cache outcome for GET /api/config.
+
+    `cached` comes from the API's own usage numbers, the only reliable signal:
+    a prefix below the model's minimum cacheable length is ignored silently,
+    with no error and no way to predict it from a fixed threshold (the minimum
+    is per-model and not monotonic across generations). It needs both counters
+    — a hit writes nothing and reads everything, so `written` alone would
+    report a live cache as a failed one.
+    """
+    global _cache_status
+    _cache_status = [
+        {
+            "target": w.backend.target,
+            # getattr: these are Claude-backend fields, not part of the
+            # documented Backend contract, and a missing one must not take
+            # down session startup before the transcriber has even opened.
+            "requested": getattr(w.backend, "cache_requested", False),
+            "written": getattr(w.backend, "cache_written", 0),
+            "read": getattr(w.backend, "cache_read", 0),
+            "cached": bool(getattr(w.backend, "cache_written", 0)
+                           or getattr(w.backend, "cache_read", 0)),
+        }
+        for w in workers
+    ]
 
 
 def run_session(api_key: str, device_index: int, anthropic_api_key: str,
@@ -640,6 +807,7 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str,
     # Warm each cached worker's ephemeral cache before opening the mic.
     for w in workers:
         w.warm()
+    _record_cache_status(workers)
     for w in workers:
         w.start()
 
@@ -732,7 +900,8 @@ def main():
     parser.add_argument("--outline", type=str, default=None,
                         help="Path to a UTF-8 .txt sermon outline for context. "
                              "Enables per-target prompt caching when the combined "
-                             "system prompt exceeds 1024 tokens.")
+                             "system prompt is long enough for the model to "
+                             "cache it.")
     parser.add_argument("--transcriber", choices=["soniox"], default="soniox",
                         help="Transcription backend (default: soniox). "
                              "Loads transcribe_<name>.py at startup.")

@@ -837,6 +837,11 @@
         // Server restarted mid-service — its counter is behind ours. Resync
         // to the window start so the fresh backlog still renders.
         lastCount = start;
+        // The new session may be running different targets, which changes what
+        // each slot resolves to. Without this a box left open across a session
+        // change keeps the old pool and can sit blank — initConfig re-hydrates
+        // only when the pool actually differs, so this is cheap when it hasn't.
+        initConfig();
       }
       const newLines = data.lines.slice(Math.max(0, lastCount - start));
       lastCount = total;
