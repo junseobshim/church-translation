@@ -11,12 +11,45 @@ from main import OUTLINE_WRAPPER, build_prompt
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
-CACHE_MIN_TOKENS = 1024
+
+# output_config.effort defaults to "high" when omitted. Our output is a single
+# constrained sentence with no tools and no thinking, so there is little for a
+# high effort level to buy — "low" trims token spend and generation time.
+EFFORT = "low"
+
+# Models that accept output_config.effort. Sonnet 4.5 and Haiku 4.5 reject it
+# outright with a 400, and CLAUDE_MODEL in .env can still select either, so
+# this is a real guard rather than a formality. An unrecognized model omits
+# effort entirely, which is the API default and the pre-existing behavior.
+EFFORT_MODELS = frozenset({"claude-sonnet-4-6", "claude-sonnet-5"})
+# Appended to the user message — never the system prompt — when the worker
+# cannot afford a [SKIP]. Keeping it out of `system` leaves the cached prefix
+# (prompt + outline) byte-identical, so a forced call still reads from cache.
+FORCE_DIRECTIVE = (
+    "\n\n(The speaker changes language after this fragment, so it will not be "
+    "continued and cannot be completed by a later phrase. Translate the words "
+    "present and do not output [SKIP].)"
+)
+
 KEEPALIVE_IDLE_SECONDS = 270  # 4m30s; stay under the 5-minute ephemeral TTL
 KEEPALIVE_POLL_SECONDS = 10
 
 
 # ── Client factory ────────────────────────────────────────────────────────────
+
+
+def effort_kwargs(model: str) -> dict:
+    """Extra request kwargs pinning the effort level for `model`.
+
+    Must be applied identically to *every* call sharing a cached prefix —
+    warmup, translation and keepalive. Changing effort between requests
+    invalidates the messages cache, and on some models the system cache that
+    holds the outline too, so setting it on only some of them would quietly
+    undo the caching this module exists to set up.
+    """
+    if model not in EFFORT_MODELS:
+        return {}
+    return {"output_config": {"effort": EFFORT}}
 
 
 def make_client(api_key: str) -> anthropic.Anthropic:
@@ -47,54 +80,39 @@ def build_system_blocks(base_prompt: str, outline: Optional[str],
 # ── Caching helpers ───────────────────────────────────────────────────────────
 
 
-def count_system_tokens(client: anthropic.Anthropic,
-                        system: Union[str, list[dict]],
-                        model: str) -> int:
-    """Exact token count for the system parameter by differencing against a
-    baseline call with no system. Uses count_tokens (free of charge)."""
-    dummy_msg = [{"role": "user", "content": "x"}]
-    baseline = client.messages.count_tokens(model=model, messages=dummy_msg)
-    full = client.messages.count_tokens(model=model, system=system, messages=dummy_msg)
-    return full.input_tokens - baseline.input_tokens
-
-
-def check_cache_eligibility(client: anthropic.Anthropic,
-                            base_prompt: str, outline: str, model: str,
-                            label: str = "") -> tuple[Union[str, list[dict]], bool]:
-    """Return (system_blocks, cache_enabled). Warns and strips cache_control
-    if the combined system tokens fall below CACHE_MIN_TOKENS. The optional
-    `label` is included in log output to distinguish per-target workers."""
-    candidate = build_system_blocks(base_prompt, outline, cache=True)
-    tokens = count_system_tokens(client, candidate, model)
-    tag = f" [{label}]" if label else ""
-    if tokens >= CACHE_MIN_TOKENS:
-        print(f"Prompt caching enabled{tag} ({tokens} system tokens).")
-        return candidate, True
-    print(
-        f"Warning: system prompt + outline is {tokens} tokens{tag}, below the "
-        f"{CACHE_MIN_TOKENS}-token caching threshold. Running without cache.",
-        file=sys.stderr,
-    )
-    return build_system_blocks(base_prompt, outline, cache=False), False
-
-
 def warm_cache(client: anthropic.Anthropic,
                system: Union[str, list[dict]], model: str,
-               label: str = "") -> None:
-    """One blocking call to populate the ephemeral cache. Exits on failure so
-    an invalid API key or model name surfaces before the session starts."""
+               label: str = "") -> tuple[int, int]:
+    """One blocking call to populate the ephemeral cache. Returns
+    (tokens written, tokens read). Exits on failure so an invalid API key or
+    model name surfaces before the session starts.
+
+    Both numbers matter: a *hit* writes nothing and reads everything, so a
+    zero write on its own does not mean caching failed. Restarting a session
+    within the 5-minute TTL with the same outline is a hit, and a read also
+    refreshes the entry's timer.
+    """
     try:
         response = client.messages.create(
             model=model,
             max_tokens=1,
             system=system,
             messages=[{"role": "user", "content": "ready"}],
+            **effort_kwargs(model),
         )
     except Exception as e:
         sys.exit(f"Cache warmup failed: {e}")
     written = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+    read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
     tag = f" [{label}]" if label else ""
-    print(f"Cache warmed{tag} ({written} tokens written).")
+    if written:
+        print(f"Cache warmed{tag} ({written} tokens written).")
+    elif read:
+        print(f"Cache warmed{tag} ({read} tokens read — entry still live from "
+              f"an earlier run).")
+    else:
+        print(f"Cache not established{tag} (nothing written or read).")
+    return written, read
 
 
 # ── Backend ───────────────────────────────────────────────────────────────────
@@ -116,6 +134,12 @@ class Backend:
         self.target = target
         self.system = system
         self.cache_enabled = cache_enabled
+        # cache_enabled is corrected by warmup() from what the API actually
+        # did; these two keep the original intent and the measured outcome so
+        # main.py can report a cache that was asked for and silently refused.
+        self.cache_requested = cache_enabled
+        self.cache_written = 0
+        self.cache_read = 0
         self.model = model
         self._last_activity = time.monotonic()
         self._activity_lock = threading.Lock()
@@ -123,21 +147,44 @@ class Backend:
 
     @classmethod
     def from_outline(cls, client: anthropic.Anthropic, source: str, target: str,
-                     outline: Optional[str], model: str) -> "Backend":
-        prompt = build_prompt(source, target)
+                     outline: Optional[str], model: str,
+                     forceable: bool = False) -> "Backend":
+        prompt = build_prompt(source, target, forceable)
         if outline is None:
             system: Union[str, list[dict]] = prompt
             cache_enabled = False
         else:
-            system, cache_enabled = check_cache_eligibility(
-                client, prompt, outline, model, label=target
-            )
+            # Always ask for caching when an outline is present. The minimum
+            # cacheable prefix is per-model (512-4096 tokens) and not monotonic
+            # across generations, so a hardcoded threshold silently goes stale
+            # on the next model change — and being wrong in the permissive
+            # direction is free here, since the API just ignores cache_control
+            # on a short prefix. warmup() reads the real outcome instead.
+            system = build_system_blocks(prompt, outline, cache=True)
+            cache_enabled = True
         return cls(client=client, source=source, target=target,
                    system=system, cache_enabled=cache_enabled, model=model)
 
     def warmup(self) -> None:
-        if self.cache_enabled:
-            warm_cache(self.client, self.system, self.model, label=self.target)
+        if not self.cache_enabled:
+            return
+        self.cache_written, self.cache_read = warm_cache(
+            self.client, self.system, self.model, label=self.target
+        )
+        if self.cache_written == 0 and self.cache_read == 0:
+            # Nothing written AND nothing read: the prefix was under this
+            # model's minimum cacheable length, so the API ignored
+            # cache_control without raising. (A zero write with a non-zero
+            # read is a hit on a still-live entry — caching is working.) Drop
+            # cache_enabled so the keepalive thread doesn't spend a request
+            # every 4m30s refreshing a cache entry that was never created.
+            self.cache_enabled = False
+            print(
+                f"Warning: prompt caching was requested for [{self.target}] but "
+                f"nothing was cached — the system prompt + outline is below "
+                f"{self.model}'s minimum cacheable length. Running without cache.",
+                file=sys.stderr,
+            )
 
     def mark_activity(self) -> None:
         with self._activity_lock:
@@ -147,12 +194,18 @@ class Backend:
         with self._activity_lock:
             return time.monotonic() - self._last_activity
 
-    def translate(self, context: list[tuple[str, str]], latest: str) -> str:
+    def translate(self, context: list[tuple[str, str]], latest: str,
+                  force: bool = False) -> str:
+        """Translate `latest`. With `force`, instruct the model not to [SKIP] —
+        see TranslationWorker._flush_pending for when that is needed."""
         messages: list[dict] = []
         for s, t in context:
             messages.append({"role": "user", "content": s})
             messages.append({"role": "assistant", "content": t})
-        messages.append({"role": "user", "content": latest})
+        messages.append({
+            "role": "user",
+            "content": (latest + FORCE_DIRECTIVE) if force else latest,
+        })
         # 4096 is a ceiling, not a target — costs nothing unless generated.
         # Sized so a coalesced catch-up batch after a long stall (the worker
         # drains its whole backlog into one call) still fits without truncation.
@@ -161,6 +214,7 @@ class Backend:
             max_tokens=4096,
             system=self.system,
             messages=messages,
+            **effort_kwargs(self.model),
         )
         if resp.stop_reason == "max_tokens":
             print(f"[{self.target} translation truncated at max_tokens]",
@@ -192,6 +246,7 @@ class Backend:
                     max_tokens=1,
                     system=self.system,
                     messages=[{"role": "user", "content": "ready"}],
+                    **effort_kwargs(self.model),
                 )
                 self.mark_activity()
                 u = response.usage

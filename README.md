@@ -1,6 +1,6 @@
 # Live Church Sermon Translation
 
-_Last updated: August 3, 2026_
+_Last updated: September 9, 2026_
 
 Real-time sermon translation using [Soniox](https://soniox.com/) real-time STT and [Claude](https://anthropic.com/) for translation, with a built-in web display for ProPresenter or any browser. Supports Korean, English, and Spanish — in any source/target combination, including multilingual (ko+en+es) sermons. Each translation target runs on its own parallel worker, so one Korean phrase can be translated into English and Spanish simultaneously on separate URLs.
 
@@ -74,6 +74,7 @@ Open in any browser or ProPresenter Web Fill:
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph`                                                                             | English translations, paragraph style                                                                                        |
 | `http://localhost:8080/?mode=translation&lang=en&display=paragraph&fontSize=96&fontWeight=500&lineSpacing=1.3&bgColor=transparent&hideStatus=1` | English translations default for RCC Sanctuary TV display (ProPresenter web fill — transparent overlay, no status indicator) |
 | `http://localhost:8080/?mode=transcription&lang=ko`                                                                                             | Only Korean transcription segments (explicit filter on the transcription stream)                                             |
+| `http://localhost:8080/?mode=translation&slot=1&display=paragraph&bgColor=transparent&hideStatus=1`                                             | Slot mode, box 1 — see **Slot mode** below. `slot=2` for the second box (trilingual services only).                          |
 
 
 
@@ -81,6 +82,36 @@ Open in any browser or ProPresenter Web Fill:
 ### Scroll-back
 
 Any caption viewer supports scrolling up to read previous captions during a live service. Scrolling up detaches the view from auto-follow; a **Back to Live** button appears and snaps back to the current caption when clicked. Caption history is preserved for the last 3 minutes by default (configurable via `?historyMinutes=`), and old lines age out of the DOM automatically — but only while pinned to the live edge, so a viewer scrolled back to read history never has content pruned out from under them.
+
+### Slot mode (experimental)
+
+A trilingual service has three languages, but a projection screen only has room for two caption boxes. `?slot=1` and `?slot=2` fill that gap: each box shows one of the languages that is **not** currently being spoken, so whichever language the speaker switches into, the others are always on screen.
+
+Point one ProPresenter web-fill text box at each. The control panel lists the slot links after Start whenever the targets **mirror** what can be spoken — every language the source can produce is also a target. That is the condition the mode needs: a phrase in a language nobody is translating into has no line to route, so the boxes would blank out or swap languages mid-service.
+
+| Source              | Mirror targets | Slot links offered           |
+| ------------------- | -------------- | ---------------------------- |
+| Multilingual        | ko + en + es   | Slot 1 and Slot 2            |
+| Korean (+ English)  | ko + en        | Slot 1 only (alternates)     |
+| Spanish (+ English) | es + en        | Slot 1 only (alternates)     |
+| English             | —              | none (English can't target English) |
+
+With two languages in play a phrase leaves only one to display, so the bilingual sources get a single box that alternates: speaking Korean it shows English, speaking English it shows Korean. With three, both boxes fill.
+
+Routing is decided per caption line rather than by tracking a "current speaker language", so the boxes can never disagree or lag each other. In the trilingual case, with the default priority order `ko,en,es`, each box gets a home language and English backfills whichever box's home language is being spoken:
+
+| Language being spoken | Slot 1      | Slot 2      |
+| --------------------- | ----------- | ----------- |
+| English               | Korean      | Spanish     |
+| Korean                | **English** | Spanish     |
+| Spanish               | Korean      | **English** |
+
+So only one box ever changes at a time, and only while its own home language is being spoken. In paragraph display the viewer forces a line break wherever the language changes, so a switch always reads as a new line instead of flowing into the previous sentence.
+
+Two things to know before relying on it:
+
+- **Mixed-language phrases.** A phrase is routed by the language it is *mostly* in. If the speaker code-switches inside a single phrase — an English sentence with a Korean quotation in it — that phrase counts as English throughout, so the embedded Korean is not separately surfaced to English readers. Switches *between* phrases, the normal case, are handled exactly.
+- **Non-mirroring sessions.** The control panel won't offer slot links unless the targets mirror the source, but a hand-typed `?slot=` URL still resolves against whatever targets are running. During a Korean → English service (English is spoken but not targeted) slot 1 shows English while Korean is spoken and goes blank during English asides. It degrades rather than showing something wrong, but use a fixed `?lang=` box there instead.
 
 ### Query Parameters
 
@@ -104,6 +135,8 @@ Any caption viewer supports scrolling up to read previous captions during a live
 | `padding`     | `20`                                                                    | Container padding in px                                                                                                                                                               |
 | `maxLines`    | `0` (unlimited)                                                         | Max lines displayed (hard cap 200)                                                                                                                                                    |
 | `historyMinutes` | `3`                                                                  | How many minutes of caption history to preserve for scroll-back. Minimum 1. Old lines age out automatically while pinned to the live edge.                                            |
+| `slot`        | —                                                                       | `1` or `2`. Slot mode (see above): shows a language not currently being spoken. `slot=2` only fills on a trilingual service. Overrides `mode`/`lang`, and disables the View dropdown.  |
+| `priority`    | `ko,en,es`                                                              | Slot priority order — all three codes, comma-separated. Slot 1 takes the first language left after removing the one being spoken, slot 2 the second.                                  |
 
 
 
@@ -173,13 +206,60 @@ See [CLI.md](CLI.md) for the full flag reference.
 
 
 
+## Translation pipeline
+
+Three mechanisms sit between a finalized phrase and a caption on screen. Two of them compose cleanly; the third collides with one of the others in exactly one place, which is handled explicitly.
+
+**1. Coalescing** — every target language runs its own worker with its own queue. A worker blocks for one phrase, then drains whatever else has piled up into a single API call. Phrases arrive at roughly the speed of one translation round-trip, so translating strictly one-per-call lets the queue — and the on-screen lag — grow without bound whenever the API is briefly slower than speech. Coalescing caps the lag at one in-flight call plus one. When the worker is keeping up the queue is empty and every batch is a single phrase, which is the common case.
+
+**2. `[SKIP]`** — Soniox finalizes on pauses, so a phrase can arrive as a fragment with no predicate; Korean is verb-final, which makes this routine. Translating such a fragment alone yields nonsense or an invented completion, so the prompt tells the model to answer exactly `[SKIP]`. The worker stashes the text in `pending_text` and prepends it to the next call, so the fragment is translated together with the speech that completes it. A failed API call uses the same buffer for the same reason — the text rides along with the next batch instead of being dropped.
+
+**3. Splitting** — slot mode only. Every output line carries one `src` label, the language it was spoken in, and `?slot=` routes on it. If a batch spans a language change, that single label describes only part of the content, so splitting breaks the backlog at language boundaries — one call per language *run* — keeping each line's label truthful. It costs an extra round trip per boundary inside a backlog, so `slot_mode_available()` turns it on only when the targets mirror what the source can speak, which is exactly when a viewer could be in slot mode. Every other session, including the usual `ko → en`, never splits.
+
+### Where they conflict
+
+Splitting and `[SKIP]` want opposite things at a language boundary:
+
+- Splitting isolates the trailing fragment before a switch — and an isolated fragment is precisely what the prompt tells the model to `[SKIP]`.
+- `[SKIP]` then prepends that fragment to the next call, which is in the other language. `pending_text` is spliced in *after* the batch is assembled, so the split never sees it and cannot prevent the re-merge.
+
+The result is one output line covering two spoken languages under one `src`. That cannot be repaired downstream: slot mode has N−1 boxes for N languages, on the premise that the language being spoken is heard rather than read. A merged line breaks the premise — Korean listeners need the English part, English listeners need the Korean part, Spanish listeners need both — so one target's line is dropped and its readers lose that fragment entirely.
+
+### How it is resolved
+
+In slot mode only, a pending fragment about to merge into a batch of a different language is translated on its own first (`TranslationWorker._flush_pending`), with a directive in the **user message** — not the cached system prompt — telling the model not to answer `[SKIP]`. The fragment is about to stop being completable, so deferring is no longer an option. Re-asking without that directive would skip again, since neither the input nor the rolling context has changed since the call that skipped.
+
+The check sits where `pending_text` is *consumed* rather than where it is filled, so it covers the API-error path as well as `[SKIP]`. If the forced call skips anyway, or fails, pending is left alone and the ordinary merge happens — degraded, not broken.
+
+The cost is one extra call, and only when slot mode, a pending fragment, and a language change all coincide. Every other case — including every non-slot session — follows exactly the path it did before.
+
+### The concision clause
+
+Added 2026-09-09, and **isolated so it can be removed cleanly** if it proves to cost translation quality. It is one constant, `CONCISION_CLAUSE` in `main.py`, inserted into every system prompt (all sources, all targets, slot mode or not) directly after the "Output ONLY the translation" line:
+
+> Display space is limited: prefer the shortest rendering that preserves the full meaning and context. Never trade accuracy, context or literalness for brevity.
+
+The intent is a **tie-breaker only**. Accuracy, context-awareness and literalness outrank brevity; brevity decides only among renderings that are already equally faithful. It is phrased as a property of the single output rather than a choice between two, since the model only ever emits one. The second sentence exists to keep the first from being read as a licence to compress, which is the failure mode to watch for in testing — clipped clauses, dropped qualifiers, names or scripture references shortened away.
+
+To remove it: delete the `CONCISION_CLAUSE` constant and the single `f"{CONCISION_CLAUSE}"` line in `build_prompt`. Nothing else references it. Costs ~30 tokens per prompt.
+
+### Knobs, if this needs retuning
+
+| Mechanism | Where | Notes |
+| --------- | ----- | ----- |
+| Coalescing | always on, no switch | drains whatever is queued at the moment the worker frees up |
+| Splitting | `slot_mode_available()` in `main.py` | must stay in step with `SPOKEN_LANGS` in `control.html`, which gates the slot links |
+| `[SKIP]` | prompt text in `build_prompt` | dropping it entirely would end the conflict outright, at the cost of nonsense translations on fragments |
+| Concision | `CONCISION_CLAUSE` in `main.py` | one constant plus one line in `build_prompt`; see above |
+| Forced flush | `TranslationWorker._flush_pending` | gated on `split_on_lang_change`; falls through to the old merge if the forced call still skips |
+
 ## Architecture
 
 The codebase splits into a shared shell plus per-backend modules:
 
 - `main.py` — shared infrastructure: audio capture, web caption server, Cloudflare tunnel (torn down on `SIGINT`/`SIGTERM` so it never outlives the session), prompt-building scaffolding, the LLM-agnostic `TranslationWorker` (queue/`[SKIP]`/rolling context), orchestration, and CLI. It loads the requested transcription and translation modules lazily via `importlib`, so a deployment using only e.g. `azure` + `gemini` backends would not pull in `websockets` or `anthropic`.
 - `transcribe_soniox.py` — Soniox transcription backend: WebSocket session, audio pump, recv/gating loop, term lists, and the `[Transcription]` print. Imports `websockets`.
-- `translate_claude.py` — Claude translation backend: per-target system prompt, ephemeral cache eligibility check, cache warmup, keepalive thread, and the `messages.create` translation call. Imports `anthropic`.
+- `translate_claude.py` — Claude translation backend: per-target system prompt, cache warmup (which measures what was actually cached rather than predicting it from a token threshold), keepalive thread, and the `messages.create` translation call. Imports `anthropic`.
 - `control_server.py` — Volunteer control panel server (`http://localhost:9090`). Serves `control.html`, manages the `main.py` subprocess (stopping it — and its Cloudflare tunnel — cleanly), and shuts itself down when the browser tab closes.
 - `control.html` — Volunteer UI: device selection, source/target language picker, optional sermon outline upload (`.txt` or in-browser `.docx` conversion), start/stop controls, and live caption viewer links.
 - `launcher.sh` — Automator shell script: reaps any stale Cloudflare tunnel, launches `control_server.py`, opens Chrome, and waits — cleaning up the servers and tunnel when the panel shuts down.
@@ -187,7 +267,7 @@ The codebase splits into a shared shell plus per-backend modules:
 Alternative backends drop in alongside without modifying the main file beyond extending the `--transcriber` / `--translator` choice lists. They must implement these contracts:
 
 - `Transcriber(source, api_key)` with `run(device_index, on_phrase, stop_event)` — blocking; calls `on_phrase(text)` once per finalized phrase and prints `[Transcription] {text}` itself.
-- `Backend` with `from_outline(client, source, target, outline, model)` classmethod plus `warmup()`, `translate(context, latest)`, `mark_activity()`, and `start_keepalive(stop_event)` instance methods. Module-level `make_client(api_key)` factory and `DEFAULT_MODEL` constant.
+- `Backend` with `from_outline(client, source, target, outline, model, forceable=False)` classmethod plus `warmup()`, `translate(context, latest, force=False)`, `mark_activity()`, and `start_keepalive(stop_event)` instance methods. Module-level `make_client(api_key)` factory and `DEFAULT_MODEL` constant.
 
 `websockets` is Soniox-only and `anthropic` is Claude-only at the import level — both are still required for the default Soniox + Claude path. Once optional backends ship, `requirements.txt` may split into extras keyed by backend.
 
