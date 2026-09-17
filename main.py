@@ -131,42 +131,54 @@ CONCISION_CLAUSE = (
 # translates them naturally without hints. This table is for proper nouns and
 # address-form overrides specific to a direction pair.
 #
-# 그루터기 교회 / Remnant Church is the church's official name in each language,
-# not a translation of the other — without the hint Claude renders it literally
-# ("Stump Church"). There is no official Spanish name, so es targets are left to
-# translate it naturally.
-CHURCH_TO_EN = ('그루터기 교회 → Remnant Church (the church\'s official English '
-                'name — never render it literally, e.g. "Stump Church")')
-CHURCH_TO_KO = "Remnant Church → 그루터기 교회"
+# Church-specific proper nouns (official church name, pastor's name, other
+# staff/ministries/buildings — anything with a non-literal official
+# translation) come from CUSTOM_TERMS: a JSON array of {"ko": ..., "en": ...,
+# "es": ...} objects (any subset of languages per entry), managed from the
+# app's Settings window so adding one never requires a code change. Without
+# any set, Claude just translates those words naturally (which may render a
+# name literally, e.g. "Stump Church").
+def _parse_custom_terms() -> list[dict]:
+    raw = os.environ.get("CUSTOM_TERMS", "").strip()
+    if not raw:
+        return []
+    try:
+        terms = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(terms, list):
+        return []
+    return [t for t in terms if isinstance(t, dict)]
 
-# The pastor is 정목사 in Korean and Pastor Joe in both English and Spanish, so
-# one English-side form serves en and es targets. Mapped in both directions:
-# a Korean source needs 정목사 → Pastor Joe, and every ko target needs the
-# reverse — every source can carry English speech (SOURCE_LANGS has "en" in all
-# four), so without it a spoken "Pastor Joe" reaches Korean readers as-is.
-PASTOR_TO_EN = "정목사 → Pastor Joe"
-PASTOR_TO_KO = "Pastor Joe → 정목사"
 
-TERM_PREFS_BY_PAIR = {
-    ("ko", "en"):    f"여러분 → everyone; {PASTOR_TO_EN}; {CHURCH_TO_EN}.",
-    ("ko", "es"):    f"여러분 → todos; {PASTOR_TO_EN}.",
-    ("en", "ko"):    f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
-    ("en", "es"):    "",
-    ("es", "en"):    "",
-    ("es", "ko"):    f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
-    # Same-language targets: a bilingual source (ko+en or es+en) may also select
-    # its base language as a target, so matching segments pass through unchanged
-    # and only overrides for the source's *other* language apply. --source en is
-    # pure English and never targets en, so there is no (en, en) entry.
-    ("ko", "ko"):    f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
-    ("es", "es"):    "",
-    # multi → any: 정목사 only appears in Korean speech, so en/es targets take
-    # the ko-side prefs; a ko target needs the reverse, since the same service
-    # can carry English speech naming the pastor and the church.
-    ("multi", "en"): f"여러분 → everyone; {PASTOR_TO_EN}; {CHURCH_TO_EN}.",
-    ("multi", "es"): f"여러분 → todos; {PASTOR_TO_EN}.",
-    ("multi", "ko"): f"{PASTOR_TO_KO}; {CHURCH_TO_KO}.",
-}
+def _term_prefs(source: str, target: str) -> str:
+    custom_terms = _parse_custom_terms()
+
+    # ko/multi → en/es: 여러분-style address hint only applies here since a
+    # Korean honorific never appears in en/es source speech.
+    if source in ("ko", "multi") and target in ("en", "es"):
+        everyone = "everyone" if target == "en" else "todos"
+        parts = [f"여러분 → {everyone}"]
+        for t in custom_terms:
+            ko = str(t.get("ko", "")).strip()
+            tgt_val = str(t.get(target, "")).strip()
+            if ko and tgt_val:
+                parts.append(f"{ko} → {tgt_val}")
+        return "; ".join(parts) + "."
+
+    # Anything targeting ko (including ko → ko passthrough) gets the reverse
+    # hints, regardless of source.
+    if target == "ko":
+        parts = []
+        for t in custom_terms:
+            ko = str(t.get("ko", "")).strip()
+            en = str(t.get("en", "")).strip()
+            if ko and en:
+                parts.append(f"{en} → {ko}")
+        return "; ".join(parts) + "." if parts else ""
+
+    return ""
+
 
 def _article(phrase: str) -> str:
     """"a" or "an" for the phrase that follows.
@@ -241,7 +253,7 @@ def build_prompt(source: str, target: str, forceable: bool = False) -> str:
         f"Translate segments in other languages into {tname}, even if they repeat "
         "or paraphrase already-translated content — always include both."
     )
-    prefs = TERM_PREFS_BY_PAIR[(source, target)]
+    prefs = _term_prefs(source, target)
     prefs_clause = f"Preferred terms: {prefs} " if prefs else ""
     skip_clause = (
         "If the fragment is too incomplete or garbled, output exactly: [SKIP] "
