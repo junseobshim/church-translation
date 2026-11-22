@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from typing import Callable, Optional
 
 from websockets import ConnectionClosedOK
@@ -123,7 +124,12 @@ class Transcriber:
         self.api_key = api_key
 
     def run(self, device_index: int, on_phrase: Callable[[str], None],
-            stop_event: threading.Event) -> None:
+            stop_event: threading.Event,
+            on_tokens: Optional[Callable[[list[dict]], None]] = None) -> None:
+        """`on_tokens`, if given, receives each phrase's spoken tokens with
+        wall-clock `abs_start_ms`/`abs_end_ms` (epoch ms) added — Soniox's own
+        start_ms/end_ms restart at 0 on every reconnect, so they can't place a
+        token on the session timeline by themselves."""
         config = build_soniox_config(self.source, self.api_key)
 
         # Accumulated token state — preserved across reconnects so transcription
@@ -138,6 +144,14 @@ class Transcriber:
 
         consecutive_failures = 0
 
+        def emit_tokens(tokens: list[dict]) -> None:
+            if on_tokens is None or not tokens:
+                return
+            try:
+                on_tokens(tokens)
+            except Exception as e:  # a transcript problem must never stop captions
+                print(f"[Transcript] write error: {e}")
+
         while not stop_event.is_set():
             try:
                 print(f"Connecting to Soniox{'(reconnecting)' if consecutive_failures else ''}...")
@@ -145,10 +159,17 @@ class Transcriber:
                     ws.send(json.dumps(config))
                     consecutive_failures = 0  # reset on successful connect
 
+                    # Wall-clock time of this connection's first audio byte:
+                    # Soniox token times are offsets from it. Set by the pump
+                    # before any token can come back.
+                    audio_t0 = {"ms": None}
+
                     def audio_pump():
                         try:
                             for chunk in iter_audio_chunks(device_index, SAMPLE_RATE,
                                                            CHUNK_FRAMES, stop_event):
+                                if audio_t0["ms"] is None:
+                                    audio_t0["ms"] = time.time() * 1000
                                 ws.send(chunk)
                         except Exception:
                             pass
@@ -178,6 +199,9 @@ class Transcriber:
                                             final_translation_tokens.append(token)
                                         continue
                                     if token.get("is_final"):
+                                        if "start_ms" in token and audio_t0["ms"] is not None:
+                                            token["abs_start_ms"] = audio_t0["ms"] + token["start_ms"]
+                                            token["abs_end_ms"] = audio_t0["ms"] + token.get("end_ms", token["start_ms"])
                                         final_tokens.append(token)
 
                             if len(final_translation_tokens) == prev_translation_count:
@@ -190,6 +214,7 @@ class Transcriber:
 
                             print(f"[Transcription] {text}")
                             on_phrase(text)
+                            emit_tokens([t for t in new_tokens if "abs_start_ms" in t])
 
                             if res.get("finished"):
                                 print("Session finished.")
@@ -225,3 +250,8 @@ class Transcriber:
             if not stop_event.is_set():
                 print(f"[Soniox] Waiting {RECONNECT_DELAY}s before reconnect…")
                 stop_event.wait(RECONNECT_DELAY)
+
+        # Words finalized after the last phrase gate (the tail of whatever was
+        # being said at shutdown) never reach on_phrase; keep them in the
+        # transcript anyway.
+        emit_tokens([t for t in final_tokens[prev_final_count:] if "abs_start_ms" in t])

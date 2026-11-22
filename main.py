@@ -24,6 +24,8 @@ threading.excepthook = lambda args: None
 import sounddevice as sd
 from dotenv import load_dotenv
 
+from transcript import SrtTranscript
+
 
 # ── Audio constants ───────────────────────────────────────────────────────────
 
@@ -829,15 +831,21 @@ def run_session(api_key: str, device_index: int, anthropic_api_key: str,
         for w in workers:
             w.enqueue(spoken, text)
 
+    # Source-language speech only, as SRT, in transcripts/<session start>.srt.
+    transcript = SrtTranscript()
+    print(f"Transcript: {transcript.path}")
+
     transcriber = transcriber_cls(source=source, api_key=api_key)
     try:
-        transcriber.run(device_index, on_phrase, stop_event)
+        transcriber.run(device_index, on_phrase, stop_event,
+                        on_tokens=transcript.add_tokens)
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     except Exception as e:
         print(f"Error: {e}")
     finally:
         stop_event.set()
+        transcript.close()
 
 
 def _parse_and_validate_targets(source: str, target_arg: Optional[str]) -> list[str]:

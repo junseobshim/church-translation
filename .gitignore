@@ -25,3 +25,6 @@ worker/.wrangler/
 
 # Apps (for one click launch)
 *.app
+
+# Per-session SRT transcripts (main.py → transcript.py)
+transcripts/
